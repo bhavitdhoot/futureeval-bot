@@ -1,0 +1,18 @@
+{
+  "updated": "2026-09-22",
+  "main": [
+    33121,
+    "fall-futureeval-2026"
+  ],
+  "open_questions": {
+    "33121": 1,
+    "fall-futureeval-2026": 1
+  },
+  "rejected": [
+    "fall-aib-2026: HTTPError",
+    "spring-futureeval-2027: HTTPError",
+    "spring-aib-2027: HTTPError"
+  ],
+  "current_season_found": true,
+  "minibench_ok": true
+}
