@@ -1,0 +1,39 @@
+name: Test bot
+
+# Run this by hand after setup (Actions > Test bot > Run workflow).
+# 1. Runs the offline test suite (no network, no credits used).
+# 2. Forecasts on Metaculus's bot-testing-area, a practice tournament that
+#    exists for exactly this, so you can see real forecasts land on your bot's
+#    profile. Uses a few cents of credits.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Offline tests
+        run: python -m pytest -q tests/
+      - name: Live forecast on the practice tournament
+        run: python main.py --mode test_questions
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          ROSTER_MODE: ${{ vars.ROSTER_MODE }}
+          FORECAST_MODELS: ${{ vars.FORECAST_MODELS }}
+          BACKUP_MODELS: ${{ vars.BACKUP_MODELS }}
+          PARSER_MODELS: ${{ vars.PARSER_MODELS }}
