@@ -104,7 +104,8 @@ def discover(today: dt.date, probe: Callable[[int | str], int]) -> dict:
 def check(targets: dict | None, today: dt.date, credits_remaining: float | None) -> list[str]:
     """Return a list of human-readable problems. Empty list means all good."""
     problems = []
-    floor = float(os.getenv("CREDIT_FLOOR_USD", "25"))
+    # GitHub passes unset repo variables as "", so a plain getenv default is not enough.
+    floor = float(os.getenv("CREDIT_FLOOR_USD") or 25)
     if credits_remaining is not None and credits_remaining < floor:
         problems.append(
             f"OpenRouter credits are low: ${credits_remaining:.2f} left (alert floor ${floor:.0f}). "
