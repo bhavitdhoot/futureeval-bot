@@ -226,6 +226,16 @@ def test_check_alerts_on_low_credits_only():
     assert any("credits are low" in p for p in maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=10))
 
 
+def test_empty_env_vars_behave_like_unset(monkeypatch):
+    # GitHub Actions passes unset repository variables as empty strings.
+    for var in ("CREDIT_FLOOR_USD", "EXTRA_TOURNAMENTS", "ROSTER_MODE", "SKIP_MINIBENCH", "FORECAST_MODELS"):
+        monkeypatch.setenv(var, "")
+    t = maintenance.discover(dt.date(2026, 10, 1), fake_probe)
+    assert maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=300) == []
+    assert any("credits are low" in p for p in maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=10))
+    assert [m.model for m in botmain.build_roster(2).primaries] == [GPT, CLAUDE]
+
+
 def test_main_uses_fresh_targets_file(tmp_path, monkeypatch):
     f = tmp_path / "TARGETS.json"
     monkeypatch.setattr(maintenance, "TARGETS_FILE", f)
