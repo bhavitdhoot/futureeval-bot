@@ -71,9 +71,21 @@ DEFAULT_PARSERS = [
     "openrouter/openai/gpt-5.6-luna",
     "openrouter/openai/gpt-4o-mini",
 ]
-RESEARCH_FALLBACKS = [
-    "openrouter/openai/gpt-4o-search-preview",
+# Research models, tried in order. OpenRouter's ":online" suffix adds live web
+# search to any model. The framework's old default (gpt-4o-search-preview) was
+# retired from OpenRouter, which silently left the bot forecasting with no news
+# at all, so these are checked against the live model list and overridable with
+# the RESEARCH_MODELS variable. If all of them fail we forecast without
+# research rather than let a non-search model invent the news.
+DEFAULT_RESEARCH = [
+    "openrouter/openai/gpt-5.6-terra:online",
+    "openrouter/openai/gpt-5.6-sol:online",
 ]
+
+
+def research_models() -> list[str]:
+    raw = os.getenv("RESEARCH_MODELS", "").strip()
+    return [m.strip() for m in raw.split(",") if m.strip()] or DEFAULT_RESEARCH
 
 
 def _parse_model_list(env_name: str, default: list[tuple[str, str | None]]):
@@ -194,7 +206,7 @@ class FutureEvalBot(SummerTemplateBot2026):
             f"Resolution criteria: {question.resolution_criteria}\n\n"
             f"Fine print: {question.fine_print}"
         )
-        for model in RESEARCH_FALLBACKS:
+        for model in research_models():
             try:
                 llm = GeneralLlm(model=model, temperature=None, timeout=180, allowed_tries=1)
                 return await llm.invoke(prompt)
@@ -206,7 +218,7 @@ class FutureEvalBot(SummerTemplateBot2026):
 
 def make_bot(n_predictions: int, publish: bool) -> FutureEvalBot:
     researcher = "asknews/news-summaries" if asknews_configured() else GeneralLlm(
-        model=RESEARCH_FALLBACKS[0], temperature=None, timeout=180, allowed_tries=1
+        model=research_models()[0], temperature=None, timeout=180, allowed_tries=1
     )
     parser = build_parser_llm()
     return FutureEvalBot(
