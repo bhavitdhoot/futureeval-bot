@@ -158,14 +158,15 @@ class RosterLlm(GeneralLlm):
         raise RuntimeError("Every model in the chain failed: " + " | ".join(errors))
 
 
-def build_roster(n_predictions: int) -> RosterLlm:
+def build_roster(n_predictions: int, max_tokens: int = 32000) -> RosterLlm:
     primary_specs = _parse_model_list("FORECAST_MODELS", DEFAULT_PRIMARY)
     backup_specs = _parse_model_list("BACKUP_MODELS", DEFAULT_BACKUPS)
-    primaries = [make_llm(m, e) for m, e in primary_specs]
+    primaries = [make_llm(m, e, max_tokens=max_tokens) for m, e in primary_specs]
     # "full" mode can ask for more predictions than roster members; repeat in order.
     while len(primaries) < n_predictions:
         primaries.append(primaries[len(primaries) % len(primary_specs)])
-    return RosterLlm(primaries[:max(n_predictions, 1)], [make_llm(m, e) for m, e in backup_specs])
+    backups = [make_llm(m, e, max_tokens=max_tokens) for m, e in backup_specs]
+    return RosterLlm(primaries[:max(n_predictions, 1)], backups)
 
 
 def build_parser_llm() -> RosterLlm:
@@ -216,7 +217,7 @@ class FutureEvalBot(SummerTemplateBot2026):
         return ""
 
 
-def make_bot(n_predictions: int, publish: bool) -> FutureEvalBot:
+def make_bot(n_predictions: int, publish: bool, max_tokens: int = 32000) -> FutureEvalBot:
     researcher = "asknews/news-summaries" if asknews_configured() else GeneralLlm(
         model=research_models()[0], temperature=None, timeout=180, allowed_tries=1
     )
@@ -232,7 +233,7 @@ def make_bot(n_predictions: int, publish: bool) -> FutureEvalBot:
         extra_metadata_in_explanation=True,
         required_successful_predictions=0.01,  # one surviving model is enough to publish
         llms={
-            "default": build_roster(n_predictions),
+            "default": build_roster(n_predictions, max_tokens),
             "summarizer": parser,  # unused (summaries disabled) but must be set
             "researcher": researcher,
             "parser": parser,
@@ -263,23 +264,70 @@ def main_tournaments(today: dt.date) -> list[int | str]:
 
 
 # --------------------------------------------------------------------------
+# Spending plan
+# --------------------------------------------------------------------------
+def plan_for_budget(remaining: float | None) -> tuple[int, int, int, str]:
+    """
+    Decide how much effort each question gets, from the credits left.
+
+    Metaculus releases credits incrementally: an initial grant, then more if
+    MiniBench performance is above average (plus a bonus for open-source bots).
+    So when credits are tight, MiniBench keeps the two-model ensemble, because
+    that is the tournament that unlocks the rest of the funding, while
+    tournament questions drop to one forecast so coverage never hits zero.
+
+    Returns (tournament forecasts, MiniBench forecasts, max_tokens, why).
+    """
+    mode = os.getenv("ROSTER_MODE", "").strip().lower() or "auto"
+    if mode == "full":
+        return 3, 2, 32000, "ROSTER_MODE=full"
+    if mode == "lean":
+        return 2, 1, 32000, "ROSTER_MODE=lean"
+    if remaining is None:
+        return 2, 1, 32000, "credit balance unknown, assuming lean"
+    if remaining >= 300:
+        return 2, 2, 32000, f"${remaining:.0f} left, running full strength"
+    if remaining >= 120:
+        return 1, 2, 24000, f"${remaining:.0f} left, MiniBench prioritised"
+    if remaining >= 25:
+        return 1, 2, 12000, f"${remaining:.0f} left, MiniBench prioritised, shorter reasoning"
+    if remaining >= 6:
+        return 1, 1, 8000, f"${remaining:.0f} left, minimum viable coverage"
+    return 0, 0, 8000, f"${remaining:.2f} left, paused"
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 async def run(mode: str, publish: bool) -> int:
     # Fresh semaphore bound to this event loop.
     FutureEvalBot._concurrency_limiter = asyncio.Semaphore(FutureEvalBot._max_concurrent_questions)
 
-    full = os.getenv("ROSTER_MODE", "lean").strip().lower() == "full"
-    main_bot = make_bot(3 if full else 2, publish)
-    mini_bot = make_bot(2 if full else 1, publish)
+    remaining = maintenance.fetch_credits_remaining()
+    main_preds, mini_preds, max_tokens, note = plan_for_budget(remaining)
+    logger.info(
+        f"Budget plan: {main_preds} forecast(s) per tournament question, "
+        f"{mini_preds} per MiniBench question, max_tokens={max_tokens} ({note})"
+    )
+    if main_preds == 0 and mini_preds == 0:
+        logger.error("Out of credits: skipping this run. Request more through the Metaculus form.")
+        return 0
+
+    main_bot = make_bot(main_preds, publish, max_tokens)
+    mini_bot = make_bot(max(mini_preds, 1), publish, max_tokens)
 
     if mode == "test_questions":
         main_bot.skip_previously_forecasted_questions = False
         jobs = [(main_bot, TEST_AREA)]
     else:
-        jobs = [(main_bot, t) for t in main_tournaments(dt.date.today())]
-        if os.getenv("SKIP_MINIBENCH", "").lower() not in ("1", "true", "yes"):
+        # MiniBench first: it is the cheaper tournament AND the one Metaculus
+        # measures when deciding whether to release more credits. If a run is
+        # cut short, this is the half we want finished.
+        jobs = []
+        if mini_preds and os.getenv("SKIP_MINIBENCH", "").lower() not in ("1", "true", "yes"):
             jobs.append((mini_bot, MINIBENCH))
+        if main_preds:
+            jobs += [(main_bot, t) for t in main_tournaments(dt.date.today())]
 
     successes, failures = 0, 0
     for bot, tournament in jobs:
@@ -297,6 +345,11 @@ async def run(mode: str, publish: bool) -> int:
                 logger.info(f"[{tournament}] forecast OK: {r.question.page_url}")
     used = main_bot.get_llm("default", "llm").usage_log + mini_bot.get_llm("default", "llm").usage_log
     logger.info(f"Run finished: {successes} forecast(s), {failures} failure(s); models used: {used}")
+    left = maintenance.fetch_credits_remaining()
+    if remaining is not None and left is not None:
+        spent = remaining - left
+        per_q = f"${spent / successes:.3f}" if successes else "n/a"
+        logger.info(f"Credits: ${left:.2f} left, ${spent:.2f} spent this run, {per_q} per question")
 
     # Fail the workflow (which makes GitHub email you) only for systematic
     # breakage: something failed and nothing succeeded. Isolated failures are
