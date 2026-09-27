@@ -250,6 +250,62 @@ def test_main_uses_fresh_targets_file(tmp_path, monkeypatch):
     assert all(not isinstance(t, str) for t in botmain.main_tournaments(dt.date(2026, 10, 1)))
 
 
+# ---------------- budget planning ----------------
+def test_budget_tiers_prioritise_minibench(monkeypatch):
+    monkeypatch.delenv("ROSTER_MODE", raising=False)
+    assert botmain.plan_for_budget(500)[:3] == (2, 2, 32000)
+    assert botmain.plan_for_budget(150)[:3] == (1, 2, 24000)      # $100 grant territory
+    assert botmain.plan_for_budget(100)[:3] == (1, 2, 12000)
+    assert botmain.plan_for_budget(10)[:3] == (1, 1, 8000)
+    assert botmain.plan_for_budget(2)[:2] == (0, 0)               # stop before running dry
+    assert botmain.plan_for_budget(None)[:3] == (2, 1, 32000)     # unknown balance
+    # MiniBench never gets less effort than the main tournament while credits are tight
+    for bal in (150, 100, 40):
+        main_preds, mini_preds, _, _ = botmain.plan_for_budget(bal)
+        assert mini_preds >= main_preds
+
+
+def test_roster_mode_overrides_budget(monkeypatch):
+    monkeypatch.setenv("ROSTER_MODE", "full")
+    assert botmain.plan_for_budget(5)[:3] == (3, 2, 32000)
+    monkeypatch.setenv("ROSTER_MODE", "lean")
+    assert botmain.plan_for_budget(5)[:3] == (2, 1, 32000)
+
+
+def test_max_tokens_reaches_the_models():
+    roster = botmain.build_roster(2, max_tokens=12000)
+    assert all(m.litellm_kwargs["max_tokens"] == 12000 for m in roster.primaries)
+    assert all(m.litellm_kwargs["max_tokens"] == 12000 for m in roster.backups)
+
+
+def test_minibench_runs_before_main_tournament(monkeypatch):
+    monkeypatch.delenv("ROSTER_MODE", raising=False)
+    monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: 100.0)
+    order = []
+
+    async def record(self, tournament, return_exceptions=True):
+        order.append(tournament)
+        return []
+
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_on_tournament", record)
+    assert run(botmain.run("tournament", publish=False)) == 0
+    assert order[0] == botmain.MINIBENCH and len(order) > 1
+
+
+def test_no_forecasting_when_credits_are_gone(monkeypatch):
+    monkeypatch.delenv("ROSTER_MODE", raising=False)
+    monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: 1.0)
+    called = []
+
+    async def record(self, tournament, return_exceptions=True):
+        called.append(tournament)
+        return []
+
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_on_tournament", record)
+    assert run(botmain.run("tournament", publish=False)) == 0
+    assert called == []
+
+
 def test_run_exit_code_only_on_systematic_failure(monkeypatch):
     async def all_fail(self, tournament, return_exceptions=True):
         return [RuntimeError("boom")]
@@ -257,6 +313,7 @@ def test_run_exit_code_only_on_systematic_failure(monkeypatch):
         class R:  # minimal stand-in for a ForecastReport
             question = binary_q()
         return [RuntimeError("boom"), R()]
+    monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: 500.0)
     monkeypatch.setattr(botmain.FutureEvalBot, "forecast_on_tournament", all_fail)
     assert run(botmain.run("tournament", publish=False)) == 1
     monkeypatch.setattr(botmain.FutureEvalBot, "forecast_on_tournament", mixed)
