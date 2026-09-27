@@ -59,7 +59,7 @@ async def fake_invoke(self, prompt, system_prompt=None):
     text = prompt if isinstance(prompt, str) else str(prompt)
     if "convert text into structured data" in text or "python parsable type" in text:
         return _parse_reply(text)
-    if "search-preview" in self.model:
+    if ":online" in self.model:
         return "Recent news: nothing decisive has happened. Status quo favours No."
     p = PROB.get(self.model, 40)
     if "Percentile 10:" in text:  # numeric prompt
@@ -139,7 +139,7 @@ def test_everything_down_raises_instead_of_publishing_garbage():
 
 
 def test_research_fallback_then_none():
-    BROKEN.add(botmain.RESEARCH_FALLBACKS[0])
+    BROKEN.update(botmain.research_models())
     bot = botmain.make_bot(1, publish=False)
     report = run(bot.forecast_question(binary_q()))
     assert 0 < report.prediction < 1  # still forecasts without research
