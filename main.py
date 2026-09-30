@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import defaultdict
 
 import dotenv
@@ -357,13 +358,49 @@ async def run(mode: str, publish: bool) -> int:
     return 1 if failures and not successes else 0
 
 
+async def watch(mode: str, publish: bool, minutes: float, interval_seconds: float) -> int:
+    """
+    Keep forecasting for a while inside one job.
+
+    GitHub drops most frequent cron triggers: observed gaps between scheduled
+    runs were 2.5 to 8 hours, while tournament questions stay open for about
+    90 minutes. So instead of trusting the schedule, one run stays alive and
+    polls. Cycles cost nothing unless there is a question to forecast.
+
+    Returns the last cycle's exit code.
+    """
+    end = time.monotonic() + minutes * 60
+    rc = await run(mode, publish)
+    cycles = 1
+    while time.monotonic() + interval_seconds <= end:
+        await asyncio.sleep(interval_seconds)
+        rc = await run(mode, publish)
+        cycles += 1
+    logger.info(f"Watch window finished after {cycles} cycle(s)")
+    return rc
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["tournament", "test_questions"], default="tournament")
     ap.add_argument("--dry-run", action="store_true", help="do everything except publish")
+    ap.add_argument(
+        "--watch-minutes",
+        type=float,
+        default=float(os.getenv("WATCH_MINUTES") or 0),
+        help="keep polling for this many minutes instead of doing one pass",
+    )
+    ap.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=float(os.getenv("WATCH_INTERVAL_SECONDS") or 300),
+        help="how often to look for new questions while watching",
+    )
     args = ap.parse_args()
     for var in ("METACULUS_TOKEN", "OPENROUTER_API_KEY"):
         if not os.getenv(var):
             sys.exit(f"Missing required secret: {var}")
+    if args.watch_minutes > 0:
+        sys.exit(asyncio.run(watch(args.mode, not args.dry_run, args.watch_minutes, args.interval_seconds)))
     sys.exit(asyncio.run(run(args.mode, publish=not args.dry_run)))
