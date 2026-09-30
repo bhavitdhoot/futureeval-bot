@@ -306,6 +306,44 @@ def test_no_forecasting_when_credits_are_gone(monkeypatch):
     assert called == []
 
 
+# ---------------- watch loop ----------------
+def test_watch_polls_until_window_ends(monkeypatch):
+    clock = {"t": 0.0}
+    monkeypatch.setattr(botmain.time, "monotonic", lambda: clock["t"])
+
+    async def fake_sleep(sec):
+        clock["t"] += sec
+
+    monkeypatch.setattr(botmain.asyncio, "sleep", fake_sleep)
+    cycles = {"n": 0}
+
+    async def fake_run(mode, publish):
+        cycles["n"] += 1
+        return 0
+
+    monkeypatch.setattr(botmain, "run", fake_run)
+    # 30 minute window, polling every 5 minutes -> first pass plus 6 more
+    assert run(botmain.watch("tournament", False, 30, 300)) == 0
+    assert cycles["n"] == 7
+
+
+def test_watch_returns_last_exit_code(monkeypatch):
+    clock = {"t": 0.0}
+    monkeypatch.setattr(botmain.time, "monotonic", lambda: clock["t"])
+
+    async def fake_sleep(sec):
+        clock["t"] += sec
+
+    monkeypatch.setattr(botmain.asyncio, "sleep", fake_sleep)
+    codes = iter([0, 0, 1])
+
+    async def fake_run(mode, publish):
+        return next(codes)
+
+    monkeypatch.setattr(botmain, "run", fake_run)
+    assert run(botmain.watch("tournament", False, 10, 300)) == 1
+
+
 def test_run_exit_code_only_on_systematic_failure(monkeypatch):
     async def all_fail(self, tournament, return_exceptions=True):
         return [RuntimeError("boom")]
