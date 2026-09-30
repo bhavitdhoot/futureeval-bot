@@ -1,8 +1,11 @@
 name: Forecast on tournament questions
 
-# Every 20 minutes, offset from the hour. Tournament questions open in small
-# batches at random times and stay open about 1.5 hours, so 20 minutes is
-# plenty. Already-forecast questions are skipped automatically.
+# GitHub delivers only a fraction of frequent cron triggers (observed gaps of
+# 2.5 to 8 hours), and tournament questions stay open about 90 minutes. So each
+# run stays alive and polls internally for WATCH_MINUTES, and the schedule just
+# keeps a run queued: when one finishes, the next pending trigger starts it
+# again. Already-forecast questions are skipped, so polling costs nothing
+# unless there is something new to forecast.
 on:
   schedule:
     - cron: "7,27,47 * * * *"
@@ -18,7 +21,7 @@ permissions:
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,3 +47,6 @@ jobs:
           BACKUP_MODELS: ${{ vars.BACKUP_MODELS }}
           PARSER_MODELS: ${{ vars.PARSER_MODELS }}
           EXTRA_TOURNAMENTS: ${{ vars.EXTRA_TOURNAMENTS }}
+          # How long one run keeps polling, and how often it looks.
+          WATCH_MINUTES: ${{ vars.WATCH_MINUTES || '300' }}
+          WATCH_INTERVAL_SECONDS: ${{ vars.WATCH_INTERVAL_SECONDS || '300' }}
