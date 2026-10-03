@@ -286,10 +286,15 @@ def plan_for_budget(remaining: float | None) -> tuple[int, int, int, str]:
         return 2, 1, 32000, "ROSTER_MODE=lean"
     if remaining is None:
         return 2, 1, 32000, "credit balance unknown, assuming lean"
-    if remaining >= 300:
-        return 2, 2, 32000, f"${remaining:.0f} left, running full strength"
-    if remaining >= 120:
-        return 1, 2, 24000, f"${remaining:.0f} left, MiniBench prioritised"
+    # Thresholds assume roughly $0.07 per model call, measured over the first
+    # week (the original $0.25 estimate was borrowed and far too pessimistic).
+    # Remaining season is on the order of 450 questions, so ~$65 at two models
+    # each: spending down to about $60 is affordable, and unspent credits are
+    # worth nothing.
+    if remaining >= 200:
+        return 3, 2, 32000, f"${remaining:.0f} left, running full strength"
+    if remaining >= 60:
+        return 2, 2, 24000, f"${remaining:.0f} left, two models everywhere"
     if remaining >= 25:
         return 1, 2, 12000, f"${remaining:.0f} left, MiniBench prioritised, shorter reasoning"
     if remaining >= 6:
