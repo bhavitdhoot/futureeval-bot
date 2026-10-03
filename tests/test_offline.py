@@ -253,9 +253,10 @@ def test_main_uses_fresh_targets_file(tmp_path, monkeypatch):
 # ---------------- budget planning ----------------
 def test_budget_tiers_prioritise_minibench(monkeypatch):
     monkeypatch.delenv("ROSTER_MODE", raising=False)
-    assert botmain.plan_for_budget(500)[:3] == (2, 2, 32000)
-    assert botmain.plan_for_budget(150)[:3] == (1, 2, 24000)      # $100 grant territory
-    assert botmain.plan_for_budget(100)[:3] == (1, 2, 12000)
+    assert botmain.plan_for_budget(500)[:3] == (3, 2, 32000)
+    assert botmain.plan_for_budget(150)[:3] == (2, 2, 24000)      # $100 grant territory
+    assert botmain.plan_for_budget(100)[:3] == (2, 2, 24000)
+    assert botmain.plan_for_budget(40)[:3] == (1, 2, 12000)
     assert botmain.plan_for_budget(10)[:3] == (1, 1, 8000)
     assert botmain.plan_for_budget(2)[:2] == (0, 0)               # stop before running dry
     assert botmain.plan_for_budget(None)[:3] == (2, 1, 32000)     # unknown balance
