@@ -251,26 +251,58 @@ def test_main_uses_fresh_targets_file(tmp_path, monkeypatch):
 
 
 # ---------------- budget planning ----------------
-def test_budget_tiers_prioritise_minibench(monkeypatch):
+OCT = dt.date(2026, 10, 11)   # 87 days of season left
+DEC = dt.date(2026, 12, 20)   # 17 days left
+
+
+def test_budget_scales_with_time_left(monkeypatch):
     monkeypatch.delenv("ROSTER_MODE", raising=False)
-    assert botmain.plan_for_budget(500)[:3] == (3, 2, 32000)
-    assert botmain.plan_for_budget(150)[:3] == (2, 2, 24000)      # $100 grant territory
-    assert botmain.plan_for_budget(100)[:3] == (2, 2, 24000)
-    assert botmain.plan_for_budget(40)[:3] == (1, 2, 12000)
-    assert botmain.plan_for_budget(10)[:3] == (1, 1, 8000)
-    assert botmain.plan_for_budget(2)[:2] == (0, 0)               # stop before running dry
-    assert botmain.plan_for_budget(None)[:3] == (2, 1, 32000)     # unknown balance
-    # MiniBench never gets less effort than the main tournament while credits are tight
-    for bal in (150, 100, 40):
-        main_preds, mini_preds, _, _ = botmain.plan_for_budget(bal)
+    monkeypatch.delenv("EXPECTED_QUESTIONS_PER_DAY", raising=False)
+    monkeypatch.delenv("SEASON_END_DATE", raising=False)
+    # Same balance, different runway: late in the season it can spend freely.
+    assert botmain.plan_for_budget(78, OCT)[:3] == (1, 2, 12000)
+    assert botmain.plan_for_budget(78, DEC)[0] >= 2
+    # A big top-up unlocks full strength even with a long season left.
+    assert botmain.plan_for_budget(800, OCT)[:3] == (3, 2, 32000)
+    # Nearly empty always pauses rather than dying mid-question.
+    assert botmain.plan_for_budget(2, DEC)[:2] == (0, 0)
+    assert botmain.plan_for_budget(None, OCT)[:3] == (2, 1, 32000)
+    # While credits are tight, MiniBench never gets less effort than the main
+    # tournament (at full strength the main tournament deliberately gets more).
+    for bal in (78, 20):
+        main_preds, mini_preds, _, _ = botmain.plan_for_budget(bal, OCT)
         assert mini_preds >= main_preds
+
+
+def test_season_end_rolls_over_and_can_be_overridden(monkeypatch):
+    monkeypatch.delenv("SEASON_END_DATE", raising=False)
+    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2027, 1, 6)
+    assert botmain.season_end(dt.date(2027, 2, 1)) == dt.date(2027, 5, 6)
+    monkeypatch.setenv("SEASON_END_DATE", "2027-03-01")
+    assert botmain.season_end(dt.date(2027, 2, 1)) == dt.date(2027, 3, 1)
+    monkeypatch.setenv("SEASON_END_DATE", "not-a-date")
+    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2027, 1, 6)
+
+
+def test_retired_models_are_reported(monkeypatch):
+    monkeypatch.delenv("FORECAST_MODELS", raising=False)
+    configured = maintenance.configured_model_ids()
+    assert "openai/gpt-5.6-sol" in configured and "anthropic/claude-opus-4.8" in configured
+    assert all(not m.startswith("openrouter/") and ":online" not in m for m in configured)
+    available = set(configured) - {"openai/gpt-5.6-sol"}
+    assert maintenance.missing_models(available, configured) == ["openai/gpt-5.6-sol"]
+    assert maintenance.missing_models(None, configured) == []      # unknown, never alarms
+    t = maintenance.discover(dt.date(2026, 10, 11), fake_probe)
+    problems = maintenance.check(t, dt.date(2026, 10, 11), 300, ["openai/gpt-5.6-sol"])
+    assert any("no longer listed" in p for p in problems)
+    assert maintenance.check(t, dt.date(2026, 10, 11), 300, []) == []
 
 
 def test_roster_mode_overrides_budget(monkeypatch):
     monkeypatch.setenv("ROSTER_MODE", "full")
-    assert botmain.plan_for_budget(5)[:3] == (3, 2, 32000)
+    assert botmain.plan_for_budget(5, OCT)[:3] == (3, 2, 32000)
     monkeypatch.setenv("ROSTER_MODE", "lean")
-    assert botmain.plan_for_budget(5)[:3] == (2, 1, 32000)
+    assert botmain.plan_for_budget(5, OCT)[:3] == (2, 1, 32000)
 
 
 def test_max_tokens_reaches_the_models():
