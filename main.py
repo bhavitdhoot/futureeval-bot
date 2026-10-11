@@ -65,7 +65,7 @@ DEFAULT_PRIMARY = [
 DEFAULT_BACKUPS = [
     ("openrouter/openai/gpt-5.5", "high"),
     ("openrouter/anthropic/claude-opus-4.7", "high"),
-    ("openrouter/openai/gpt-5.2", "high"),
+    ("openrouter/openai/gpt-5.6-luna", "high"),
 ]
 DEFAULT_PARSERS = [
     "openrouter/openai/gpt-4.1-mini",  # the framework's own default parser
@@ -267,7 +267,29 @@ def main_tournaments(today: dt.date) -> list[int | str]:
 # --------------------------------------------------------------------------
 # Spending plan
 # --------------------------------------------------------------------------
-def plan_for_budget(remaining: float | None) -> tuple[int, int, int, str]:
+def season_end(today: dt.date) -> dt.date:
+    """Roughly when the current season stops opening questions."""
+    override = os.getenv("SEASON_END_DATE", "").strip()
+    if override:
+        try:
+            return dt.date.fromisoformat(override)
+        except ValueError:
+            logger.warning(f"Ignoring unparsable SEASON_END_DATE={override!r}")
+    season = maintenance.season_of(today)
+    if season == "fall":
+        return dt.date(today.year + 1, 1, 6)
+    if season == "spring":
+        return dt.date(today.year, 5, 6)
+    return dt.date(today.year, 9, 1)
+
+
+def affordable_per_question(remaining: float, today: dt.date) -> float:
+    days_left = max((season_end(today) - today).days, 1)
+    per_day = float(os.getenv("EXPECTED_QUESTIONS_PER_DAY") or 8)
+    return remaining / max(days_left * per_day, 1)
+
+
+def plan_for_budget(remaining: float | None, today: dt.date | None = None) -> tuple[int, int, int, str]:
     """
     Decide how much effort each question gets, from the credits left.
 
@@ -286,20 +308,21 @@ def plan_for_budget(remaining: float | None) -> tuple[int, int, int, str]:
         return 2, 1, 32000, "ROSTER_MODE=lean"
     if remaining is None:
         return 2, 1, 32000, "credit balance unknown, assuming lean"
-    # Thresholds assume roughly $0.07 per model call, measured over the first
-    # week (the original $0.25 estimate was borrowed and far too pessimistic).
-    # Remaining season is on the order of 450 questions, so ~$65 at two models
-    # each: spending down to about $60 is affordable, and unspent credits are
-    # worth nothing.
-    if remaining >= 200:
-        return 3, 2, 32000, f"${remaining:.0f} left, running full strength"
-    if remaining >= 60:
-        return 2, 2, 24000, f"${remaining:.0f} left, two models everywhere"
-    if remaining >= 25:
-        return 1, 2, 12000, f"${remaining:.0f} left, MiniBench prioritised, shorter reasoning"
-    if remaining >= 6:
-        return 1, 1, 8000, f"${remaining:.0f} left, minimum viable coverage"
-    return 0, 0, 8000, f"${remaining:.2f} left, paused"
+    # Spend per question, not per week. Running out in December would mean zero
+    # coverage while questions are still resolving, which costs far more than a
+    # smaller ensemble does. A question forecast with one model still scores;
+    # a question never forecast scores nothing.
+    if remaining < 6:
+        return 0, 0, 8000, f"${remaining:.2f} left, paused to avoid half-finished runs"
+    budget = affordable_per_question(remaining, today or dt.date.today())
+    note = f"${remaining:.0f} left, ${budget:.3f} affordable per question"
+    if budget >= 0.40:
+        return 3, 2, 32000, note + ", full strength"
+    if budget >= 0.22:
+        return 2, 2, 24000, note + ", two models everywhere"
+    if budget >= 0.10:
+        return 1, 2, 12000, note + ", MiniBench keeps the ensemble"
+    return 1, 1, 8000, note + ", minimum viable coverage"
 
 
 # --------------------------------------------------------------------------
@@ -310,7 +333,7 @@ async def run(mode: str, publish: bool) -> int:
     FutureEvalBot._concurrency_limiter = asyncio.Semaphore(FutureEvalBot._max_concurrent_questions)
 
     remaining = maintenance.fetch_credits_remaining()
-    main_preds, mini_preds, max_tokens, note = plan_for_budget(remaining)
+    main_preds, mini_preds, max_tokens, note = plan_for_budget(remaining, dt.date.today())
     logger.info(
         f"Budget plan: {main_preds} forecast(s) per tournament question, "
         f"{mini_preds} per MiniBench question, max_tokens={max_tokens} ({note})"
