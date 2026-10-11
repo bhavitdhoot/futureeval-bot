@@ -28,6 +28,7 @@ logger = logging.getLogger("maintenance")
 ROOT = Path(__file__).resolve().parent
 TARGETS_FILE = ROOT / "TARGETS.json"
 OPENROUTER_KEY_URL = os.getenv("OPENROUTER_KEY_URL", "https://openrouter.ai/api/v1/auth/key")
+OPENROUTER_MODELS_URL = os.getenv("OPENROUTER_MODELS_URL", "https://openrouter.ai/api/v1/models")
 FALL_2026_ID = 33121
 
 
@@ -101,7 +102,12 @@ def discover(today: dt.date, probe: Callable[[int | str], int]) -> dict:
     }
 
 
-def check(targets: dict | None, today: dt.date, credits_remaining: float | None) -> list[str]:
+def check(
+    targets: dict | None,
+    today: dt.date,
+    credits_remaining: float | None,
+    gone_models: list[str] | None = None,
+) -> list[str]:
     """Return a list of human-readable problems. Empty list means all good."""
     problems = []
     # GitHub passes unset repo variables as "", so a plain getenv default is not enough.
@@ -124,7 +130,50 @@ def check(targets: dict | None, today: dt.date, credits_remaining: float | None)
         )
     if not targets.get("minibench_ok"):
         problems.append("The MiniBench tournament could not be reached today.")
+    if gone_models:
+        problems.append(
+            "These models are no longer listed on OpenRouter and will fail when called: "
+            + ", ".join(gone_models)
+            + ". Update the FORECAST_MODELS / BACKUP_MODELS / PARSER_MODELS variables."
+        )
     return problems
+
+
+def configured_model_ids() -> list[str]:
+    """Every model the bot might call, as OpenRouter ids (no provider prefix)."""
+    import main  # imported lazily so maintenance stays importable on its own
+
+    specs = [
+        *main._parse_model_list("FORECAST_MODELS", main.DEFAULT_PRIMARY),
+        *main._parse_model_list("BACKUP_MODELS", main.DEFAULT_BACKUPS),
+        *[(m, None) for m in main.DEFAULT_PARSERS],
+        *[(m, None) for m in main.research_models()],
+    ]
+    ids = []
+    for name, _ in specs:
+        clean = name.split("openrouter/", 1)[-1].split(":online")[0]
+        if clean not in ids:
+            ids.append(clean)
+    return ids
+
+
+def missing_models(available: set[str] | None, configured: list[str]) -> list[str]:
+    """Which configured models OpenRouter no longer lists. None means unknown."""
+    if not available:
+        return []
+    return [m for m in configured if m not in available]
+
+
+def fetch_available_models() -> set[str] | None:
+    import requests
+
+    try:
+        r = requests.get(OPENROUTER_MODELS_URL, timeout=30)
+        r.raise_for_status()
+        return {m["id"] for m in r.json().get("data", [])}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not read OpenRouter's model list: {e}")
+        return None
 
 
 def fetch_credits_remaining() -> float | None:
@@ -164,7 +213,10 @@ if __name__ == "__main__":
         remaining = fetch_credits_remaining()
         if remaining is not None:
             logger.info(f"OpenRouter credits remaining: ${remaining:.2f}")
-        problems = check(targets, today, remaining)
+        gone = missing_models(fetch_available_models(), configured_model_ids())
+        if gone:
+            logger.warning(f"Models missing from OpenRouter: {gone}")
+        problems = check(targets, today, remaining, gone)
         for p in problems:
             print(f"::error::{p}")
         sys.exit(1 if problems else 0)
