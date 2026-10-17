@@ -1,12 +1,12 @@
 {
-  "updated": "2026-10-16",
+  "updated": "2026-10-17",
   "main": [
     33121,
     "fall-futureeval-2026"
   ],
   "open_questions": {
-    "33121": 0,
-    "fall-futureeval-2026": 0
+    "33121": 1,
+    "fall-futureeval-2026": 1
   },
   "rejected": [
     "fall-aib-2026: HTTPError",
