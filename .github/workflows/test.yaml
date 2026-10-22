@@ -37,3 +37,5 @@ jobs:
           FORECAST_MODELS: ${{ vars.FORECAST_MODELS }}
           BACKUP_MODELS: ${{ vars.BACKUP_MODELS }}
           PARSER_MODELS: ${{ vars.PARSER_MODELS }}
+          RESEARCH_MODELS: ${{ vars.RESEARCH_MODELS }}
+          BINARY_EXTREMIZE: ${{ vars.BINARY_EXTREMIZE }}

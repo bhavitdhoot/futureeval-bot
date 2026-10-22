@@ -34,7 +34,9 @@ import main as botmain  # noqa: E402
 GPT, CLAUDE = botmain.DEFAULT_PRIMARY[0][0], botmain.DEFAULT_PRIMARY[1][0]
 PROB = {GPT: 30, CLAUDE: 50}  # each model's "opinion" on the binary question
 BROKEN: set[str] = set()      # models that should raise
+TRUNCATED: set[str] = set()   # models that stop before their final answer
 CALLS: list[str] = []
+STYLE = {"numeric_commas": False}
 
 
 def _parse_reply(prompt: str) -> str:
@@ -43,8 +45,8 @@ def _parse_reply(prompt: str) -> str:
         p = int(re.findall(r"Probability:\s*(\d+)%", prompt)[-1])
         return json.dumps({"prediction_in_decimal": p / 100})
     if "Percentile 10" in prompt or "percentile" in prompt.lower() and "value" in prompt:
-        pts = re.findall(r"Percentile (\d+):\s*([\d.]+)", prompt)
-        return json.dumps([{"percentile": int(a) / 100, "value": float(b)} for a, b in pts[-6:]])
+        pts = re.findall(r"Percentile (\d+):\s*([\d.,]+)", prompt)
+        return json.dumps([{"percentile": int(a) / 100, "value": float(b.replace(",", ""))} for a, b in pts[-6:]])
     opts = re.findall(r'"?(Red|Green|Blue)"?:\s*(\d+)%', prompt)
     if opts:
         return json.dumps({"predicted_options": [
@@ -61,11 +63,15 @@ async def fake_invoke(self, prompt, system_prompt=None):
         return _parse_reply(text)
     if ":online" in self.model:
         return "Recent news: nothing decisive has happened. Status quo favours No."
+    if self.model in TRUNCATED:
+        return "Let me think step by step about the base rate and"
     p = PROB.get(self.model, 40)
     if "Percentile 10:" in text:  # numeric prompt
         base = 100 if self.model == GPT else 120
+        fmt = "{:,}" if STYLE["numeric_commas"] else "{}"
         return "Reasoning...\n" + "\n".join(
-            f"Percentile {q}: {base + i * 10}" for i, q in enumerate([10, 20, 40, 60, 80, 90]))
+            f"Percentile {q}: {fmt.format((base + i * 10) * (1000 if STYLE['numeric_commas'] else 1))}"
+            for i, q in enumerate([10, 20, 40, 60, 80, 90]))
     if "Option_A" in text or "Red" in text and "Blue" in text:
         return "Reasoning...\nRed: 20%\nGreen: 30%\nBlue: 50%"
     return f"Reasoning about the question...\nProbability: {p}%"
@@ -75,11 +81,16 @@ async def fake_invoke(self, prompt, system_prompt=None):
 def patch_llm(monkeypatch):
     CALLS.clear()
     BROKEN.clear()
-    orig = GeneralLlm.invoke
+    TRUNCATED.clear()
+    STYLE["numeric_commas"] = False
+    botmain._attempts.clear()
+    botmain._done.clear()
+    for var in ("BINARY_EXTREMIZE", "PARSER_MODELS", "RESEARCH_MODELS", "BACKUP_MODELS"):
+        monkeypatch.delenv(var, raising=False)
 
-    async def dispatcher(self, prompt, system_prompt=None):
+    async def dispatcher(self, prompt, system_prompt=None, **kwargs):
         if isinstance(self, botmain.RosterLlm):
-            return await orig(self, prompt, system_prompt) if False else await botmain.RosterLlm.invoke(self, prompt, system_prompt)
+            return await botmain.RosterLlm.invoke(self, prompt, system_prompt, **kwargs)
         return await fake_invoke(self, prompt, system_prompt)
 
     monkeypatch.setattr(GeneralLlm, "invoke", dispatcher)
@@ -103,8 +114,9 @@ def test_ensemble_uses_both_vendors_and_aggregates():
     report = run(bot.forecast_question(binary_q()))
     forecasters = [c for c in CALLS if c in (GPT, CLAUDE)]
     assert set(forecasters) == {GPT, CLAUDE}, forecasters
-    # framework aggregates binary predictions (median of 0.30 and 0.50 = 0.40)
-    assert abs(report.prediction - 0.40) < 1e-6, report.prediction
+    # geometric mean of odds of 0.30 and 0.50, slightly below their arithmetic mean
+    assert abs(report.prediction - botmain.pool_binary([0.3, 0.5])) < 1e-9, report.prediction
+    assert 0.39 < report.prediction < 0.40
 
 
 def test_fallback_when_one_vendor_is_down():
@@ -123,12 +135,24 @@ def test_backups_when_both_primaries_down():
     assert botmain.DEFAULT_BACKUPS[0][0] in CALLS
 
 
-def test_parser_fallback():
-    BROKEN.add(botmain.DEFAULT_PARSERS[0])
+def test_binary_parsed_locally_without_parser_calls():
     bot = botmain.make_bot(1, publish=False)
     report = run(bot.forecast_question(binary_q()))
     assert abs(report.prediction - 0.30) < 1e-6
+    assert not set(CALLS) & set(botmain.DEFAULT_PARSERS)
+
+
+def test_parser_fallback():
+    # "1,000,000" is not a plain number, so the LLM parser is needed, and its
+    # first model is down.
+    STYLE["numeric_commas"] = True
+    BROKEN.add(botmain.DEFAULT_PARSERS[0])
+    bot = botmain.make_bot(1, publish=False)
+    report = run(bot.forecast_question(numeric_q(upper=300_000)))
     assert botmain.DEFAULT_PARSERS[1] in CALLS
+    # the parsed thousands landed in the right place: P(X <= 100,000) is about 10%
+    nearest = min(report.prediction.cdf, key=lambda c: abs(c.value - 100_000))
+    assert abs(nearest.percentile - 0.10) < 0.02, nearest
 
 
 def test_everything_down_raises_instead_of_publishing_garbage():
@@ -157,15 +181,18 @@ def test_multiple_choice():
     assert abs(sum(probs.values()) - 1) < 1e-6 and probs["Blue"] > probs["Red"], probs
 
 
-def test_numeric():
-    q = NumericQuestion(
+def numeric_q(upper=300):
+    return NumericQuestion(
         question_text="How many?", id_of_post=3, id_of_question=3,
         page_url="https://www.metaculus.com/questions/3/", resolution_criteria="", fine_print="",
-        background_info="", unit_of_measure="units", upper_bound=300, lower_bound=0,
+        background_info="", unit_of_measure="units", upper_bound=upper, lower_bound=0,
         open_upper_bound=True, open_lower_bound=False, already_forecasted=False,
     )
+
+
+def test_numeric():
     bot = botmain.make_bot(2, publish=False)
-    report = run(bot.forecast_question(q))
+    report = run(bot.forecast_question(numeric_q()))
     cdf = report.prediction.cdf
     vals = [p.percentile for p in cdf]
     assert len(cdf) > 100 and all(b >= a for a, b in zip(vals, vals[1:]))
@@ -260,18 +287,22 @@ def test_budget_scales_with_time_left(monkeypatch):
     monkeypatch.delenv("EXPECTED_QUESTIONS_PER_DAY", raising=False)
     monkeypatch.delenv("SEASON_END_DATE", raising=False)
     # Same balance, different runway: late in the season it can spend freely.
-    assert botmain.plan_for_budget(78, OCT)[:3] == (1, 2, 12000)
-    assert botmain.plan_for_budget(78, DEC)[0] >= 2
+    tight = botmain.plan_for_budget(78, OCT)
+    assert (tight.main, tight.mini, tight.effort_cap) == (1, 2, "medium")
+    assert botmain.plan_for_budget(78, DEC).main >= 2
     # A big top-up unlocks full strength even with a long season left.
-    assert botmain.plan_for_budget(800, OCT)[:3] == (3, 2, 32000)
+    full = botmain.plan_for_budget(800, OCT)
+    assert (full.main, full.mini, full.effort_cap, full.web_research) == (3, 2, None, True)
     # Nearly empty always pauses rather than dying mid-question.
-    assert botmain.plan_for_budget(2, DEC)[:2] == (0, 0)
-    assert botmain.plan_for_budget(None, OCT)[:3] == (2, 1, 32000)
+    empty = botmain.plan_for_budget(2, DEC)
+    assert (empty.main, empty.mini) == (0, 0)
+    unknown = botmain.plan_for_budget(None, OCT)
+    assert (unknown.main, unknown.mini, unknown.effort_cap) == (2, 1, None)
     # While credits are tight, MiniBench never gets less effort than the main
     # tournament (at full strength the main tournament deliberately gets more).
     for bal in (78, 20):
-        main_preds, mini_preds, _, _ = botmain.plan_for_budget(bal, OCT)
-        assert mini_preds >= main_preds
+        plan = botmain.plan_for_budget(bal, OCT)
+        assert plan.mini >= plan.main
 
 
 def test_season_end_rolls_over_and_can_be_overridden(monkeypatch):
@@ -300,15 +331,21 @@ def test_retired_models_are_reported(monkeypatch):
 
 def test_roster_mode_overrides_budget(monkeypatch):
     monkeypatch.setenv("ROSTER_MODE", "full")
-    assert botmain.plan_for_budget(5, OCT)[:3] == (3, 2, 32000)
+    plan = botmain.plan_for_budget(5, OCT)
+    assert (plan.main, plan.mini, plan.effort_cap) == (3, 2, None)
     monkeypatch.setenv("ROSTER_MODE", "lean")
-    assert botmain.plan_for_budget(5, OCT)[:3] == (2, 1, 32000)
+    plan = botmain.plan_for_budget(5, OCT)
+    assert (plan.main, plan.mini, plan.effort_cap) == (2, 1, None)
 
 
-def test_max_tokens_reaches_the_models():
-    roster = botmain.build_roster(2, max_tokens=12000)
-    assert all(m.litellm_kwargs["max_tokens"] == 12000 for m in roster.primaries)
-    assert all(m.litellm_kwargs["max_tokens"] == 12000 for m in roster.backups)
+def test_tight_budget_lowers_effort_not_max_tokens():
+    roster = botmain.build_roster(2, effort_cap="medium")
+    for m in roster.primaries + roster.backups:
+        assert m.litellm_kwargs["max_tokens"] == botmain.MAX_TOKENS
+        assert m.litellm_kwargs["reasoning"] == {"effort": "medium"}
+    # a cap never raises a lower configured effort
+    assert botmain.cap_effort("low", "medium") == "low"
+    assert botmain.cap_effort(None, "medium") is None
 
 
 def test_minibench_runs_before_main_tournament(monkeypatch):
@@ -316,11 +353,11 @@ def test_minibench_runs_before_main_tournament(monkeypatch):
     monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: 100.0)
     order = []
 
-    async def record(self, tournament, return_exceptions=True):
+    def record(bot, tournament):
         order.append(tournament)
         return []
 
-    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_on_tournament", record)
+    monkeypatch.setattr(botmain, "fetch_open_questions", record)
     assert run(botmain.run("tournament", publish=False)) == 0
     assert order[0] == botmain.MINIBENCH and len(order) > 1
 
@@ -330,11 +367,11 @@ def test_no_forecasting_when_credits_are_gone(monkeypatch):
     monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: 1.0)
     called = []
 
-    async def record(self, tournament, return_exceptions=True):
+    def record(bot, tournament):
         called.append(tournament)
         return []
 
-    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_on_tournament", record)
+    monkeypatch.setattr(botmain, "fetch_open_questions", record)
     assert run(botmain.run("tournament", publish=False)) == 0
     assert called == []
 
@@ -377,15 +414,181 @@ def test_watch_returns_last_exit_code(monkeypatch):
     assert run(botmain.watch("tournament", False, 10, 300)) == 1
 
 
+def binary_q_n(n):
+    q = binary_q()
+    q.id_of_question = q.id_of_post = n
+    q.page_url = f"https://www.metaculus.com/questions/{n}/"
+    return q
+
+
 def test_run_exit_code_only_on_systematic_failure(monkeypatch):
-    async def all_fail(self, tournament, return_exceptions=True):
-        return [RuntimeError("boom")]
-    async def mixed(self, tournament, return_exceptions=True):
-        class R:  # minimal stand-in for a ForecastReport
-            question = binary_q()
-        return [RuntimeError("boom"), R()]
     monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: 500.0)
-    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_on_tournament", all_fail)
+    monkeypatch.setattr(botmain, "fetch_open_questions", lambda bot, t: [binary_q_n(1), binary_q_n(2)])
+
+    async def all_fail(self, questions, return_exceptions=True):
+        return [RuntimeError("boom") for _ in questions]
+
+    async def mixed(self, questions, return_exceptions=True):
+        return [RuntimeError("boom"), object()]
+
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_questions", all_fail)
     assert run(botmain.run("tournament", publish=False)) == 1
-    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_on_tournament", mixed)
+    botmain._attempts.clear()
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_questions", mixed)
     assert run(botmain.run("tournament", publish=False)) == 0
+
+
+# ---------------- robustness and accuracy upgrades ----------------
+def test_truncated_answer_moves_down_the_chain():
+    # GPT spends its whole budget thinking and never writes "Probability:".
+    TRUNCATED.add(GPT)
+    bot = botmain.make_bot(1, publish=False)
+    report = run(bot.forecast_question(binary_q()))
+    assert abs(report.prediction - 0.50) < 1e-6  # Claude's answer, not a parse of garbage
+    assert CALLS.count(GPT) == 1
+
+
+def test_single_prediction_keeps_other_flagship_as_first_fallback():
+    roster = botmain.build_roster(1)
+    assert [m.model for m in roster.chain(0)][:2] == [GPT, CLAUDE]
+    BROKEN.add(GPT)
+    bot = botmain.make_bot(1, publish=False)
+    run(bot.forecast_question(binary_q()))
+    assert bot.get_llm("default", "llm").usage_log == [CLAUDE]
+
+
+def test_fallback_chain_has_no_repeats():
+    roster = botmain.build_roster(3)  # [GPT, CLAUDE, GPT]
+    for k in range(3):
+        models = [m.model for m in roster.chain(k)]
+        assert len(models) == len(set(models)), models
+
+
+def test_model_list_keeps_openrouter_variants(monkeypatch):
+    monkeypatch.setenv("FORECAST_MODELS", "openrouter/openai/x:online,openrouter/anthropic/y:HIGH,z")
+    assert botmain._parse_model_list("FORECAST_MODELS", []) == [
+        ("openrouter/openai/x:online", None), ("openrouter/anthropic/y", "high"), ("z", None)]
+
+
+def test_local_parsers():
+    assert botmain.parse_binary("Probability: 20%\n...\n**Probability: 7.5%**") == 0.075
+    assert botmain.parse_binary("I think it's likely.") is None
+    assert botmain.parse_binary("The prior probability: 10% seems low.") is None
+    mc = botmain.parse_multiple_choice(
+        "- 1: 10%\n- 10: 20%\n\nFinal:\n**1**: 30%\n10: 50%\n100: 20%", ["1", "10", "100"])
+    assert {o.option_name: round(o.probability, 3) for o in mc.predicted_options} == {
+        "1": 0.3, "10": 0.5, "100": 0.2}
+    assert botmain.parse_multiple_choice("Red: 50%", ["Red", "Blue"]) is None  # missing option
+    text = "\n".join(f"Percentile {p}: {v}" for p, v in zip([10, 20, 40, 60, 80, 90], [1, 2, 3, 4, 5, 6]))
+    assert [x.value for x in botmain.parse_numeric(text)] == [1, 2, 3, 4, 5, 6]
+    assert botmain.parse_numeric(text.replace(": 6", ": 6 million")) is None  # needs the LLM parser
+    dates = "\n".join(f"Percentile {p}: 2027-0{i + 1}-15" for i, p in enumerate([10, 20, 40, 60, 80, 90]))
+    parsed = botmain.parse_date(dates)
+    assert parsed[0].value == dt.datetime(2027, 1, 15, tzinfo=dt.timezone.utc).timestamp()
+
+
+def test_reversed_percentiles_are_repaired_not_discarded():
+    from forecasting_tools import Percentile
+    reversed_ = [Percentile(percentile=p / 100, value=v) for p, v in zip([10, 20, 40, 60, 80, 90], [60, 50, 40, 30, 20, 10])]
+    assert [p.value for p in botmain.repair_percentiles(reversed_)] == [10, 20, 30, 40, 50, 60]
+
+
+def test_binary_pooling(monkeypatch):
+    assert abs(botmain.pool_binary([0.3, 0.3]) - 0.3) < 1e-9
+    assert botmain.pool_binary([0.02, 0.3]) < 0.12 < (0.02 + 0.3) / 2  # confident forecaster counts
+    monkeypatch.setenv("BINARY_EXTREMIZE", "1.5")
+    assert botmain.pool_binary([0.8, 0.8]) > 0.8
+
+
+def test_prompts_carry_the_resolution_date():
+    q = binary_q()
+    q.scheduled_resolution_time = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=10)
+    import prompts
+    text = prompts.binary_prompt(q, "")
+    assert "Scheduled resolution" in text and ("in 10.0 days" in text or "in 9.9 days" in text)
+    assert prompts.NO_RESEARCH in text and "Base rate" in text
+
+
+def test_asknews_gets_the_question_and_empty_results_fall_back(monkeypatch):
+    monkeypatch.setenv("ASKNEWS_API_KEY", "dummy")
+    queries = []
+
+    async def no_articles(self, query):
+        queries.append(query)
+        return "Here are the relevant news articles:\n\nNo articles were found.\n\n"
+
+    monkeypatch.setattr(botmain.AskNewsSearcher, "get_formatted_news_async", no_articles)
+    bot = botmain.make_bot(1, publish=False, web_research=False)
+    research = run(bot.run_research(binary_q()))
+    assert queries == ["Will X happen before 2027?"]
+    assert "## Web research" in research and "AskNews" not in research
+
+
+def test_asknews_and_web_research_combined(monkeypatch):
+    monkeypatch.setenv("ASKNEWS_API_KEY", "dummy")
+
+    async def articles(self, query):
+        return "Here are the relevant news articles:\n\n**X is likely**"
+
+    monkeypatch.setattr(botmain.AskNewsSearcher, "get_formatted_news_async", articles)
+    research = run(botmain.make_bot(1, publish=False, web_research=True).run_research(binary_q()))
+    assert "Recent news (AskNews)" in research and "Web research" in research
+    CALLS.clear()
+    research = run(botmain.make_bot(1, publish=False, web_research=False).run_research(binary_q()))
+    assert "Web research" not in research and not any(":online" in c for c in CALLS)
+
+
+def test_same_question_in_two_tournaments_is_forecast_once(monkeypatch):
+    monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: 500.0)
+    monkeypatch.setattr(botmain, "fetch_open_questions", lambda bot, t: [binary_q_n(7)])
+    forecast = []
+
+    async def record(self, questions, return_exceptions=True):
+        forecast.extend(questions)
+        return [object() for _ in questions]
+
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_questions", record)
+    run(botmain.run("tournament", publish=False))
+    run(botmain.run("tournament", publish=False))  # next cycle: already done in this job
+    assert len(forecast) == 1
+
+
+def test_persistently_failing_question_is_capped(monkeypatch):
+    monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: 500.0)
+    monkeypatch.setattr(botmain, "fetch_open_questions", lambda bot, t: [binary_q_n(8)])
+    tries = []
+
+    async def fail(self, questions, return_exceptions=True):
+        tries.extend(questions)
+        return [RuntimeError("boom") for _ in questions]
+
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_questions", fail)
+    for _ in range(6):
+        run(botmain.run("tournament", publish=False))
+    assert len(tries) == botmain.max_attempts() == 3
+
+
+def test_watch_survives_a_crashing_cycle(monkeypatch):
+    clock = {"t": 0.0}
+    monkeypatch.setattr(botmain.time, "monotonic", lambda: clock["t"])
+
+    async def fake_sleep(sec):
+        clock["t"] += sec
+
+    monkeypatch.setattr(botmain.asyncio, "sleep", fake_sleep)
+    outcomes = iter([RuntimeError("Metaculus API down"), 0, 0])
+
+    async def flaky_run(mode, publish):
+        o = next(outcomes)
+        if isinstance(o, Exception):
+            raise o
+        return o
+
+    monkeypatch.setattr(botmain, "run", flaky_run)
+    assert run(botmain.watch("tournament", False, 10, 300)) == 0
+
+
+def test_model_check_honours_parser_override(monkeypatch):
+    monkeypatch.setenv("PARSER_MODELS", "openrouter/openai/custom-parser")
+    configured = maintenance.configured_model_ids()
+    assert "openai/custom-parser" in configured and "openai/gpt-4o-mini" not in configured

@@ -22,7 +22,7 @@ Before you send payment details, ask Metaculus two questions: how they can pay a
 
 GitHub emails you when a workflow fails. The error message is at the bottom of the run's log.
 
-**"OpenRouter credits are low"** (Daily maintenance): request more credits through the form. To stretch what's left, set the variable `SKIP_MINIBENCH` to `true`, and make sure `ROSTER_MODE` isn't `full`.
+**"OpenRouter credits are low"** (Daily maintenance): request more credits through the form. The bot already scales its effort down as credits shrink. To stretch them further, set the variable `SKIP_MINIBENCH` to `true`, and make sure `ROSTER_MODE` isn't `full`.
 
 **"No [season] [year] bot tournament found"** (Daily maintenance): Metaculus probably renamed the new season's tournament. Find it on metaculus.com/aib; the ID is the number in its URL or on the page. Add it as the repository variable `EXTRA_TOURNAMENTS`. This only fires from the second month of a season, because tournaments open partway through their first month.
 

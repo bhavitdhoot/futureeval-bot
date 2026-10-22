@@ -46,7 +46,12 @@ jobs:
           FORECAST_MODELS: ${{ vars.FORECAST_MODELS }}
           BACKUP_MODELS: ${{ vars.BACKUP_MODELS }}
           PARSER_MODELS: ${{ vars.PARSER_MODELS }}
+          RESEARCH_MODELS: ${{ vars.RESEARCH_MODELS }}
+          BINARY_EXTREMIZE: ${{ vars.BINARY_EXTREMIZE }}
           EXTRA_TOURNAMENTS: ${{ vars.EXTRA_TOURNAMENTS }}
+          EXPECTED_QUESTIONS_PER_DAY: ${{ vars.EXPECTED_QUESTIONS_PER_DAY }}
+          SEASON_END_DATE: ${{ vars.SEASON_END_DATE }}
+          MAX_ATTEMPTS_PER_QUESTION: ${{ vars.MAX_ATTEMPTS_PER_QUESTION }}
           # How long one run keeps polling, and how often it looks.
           WATCH_MINUTES: ${{ vars.WATCH_MINUTES || '300' }}
           WATCH_INTERVAL_SECONDS: ${{ vars.WATCH_INTERVAL_SECONDS || '300' }}
