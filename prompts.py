@@ -24,6 +24,9 @@ untouched, for diffing against upstream). What changed, and why:
   finding bookmaker odds, with nothing telling the model how to weigh them).
 - Research prompts carry today's date, so "latest news" means something to a
   search model, and ask for base rates and scheduled events, not just headlines.
+  They also cap the brief at about 500 words: an uncapped version produced
+  13-18k-character reports in a live test, which made research the largest
+  cost per question while adding little the forecaster used.
 """
 
 from __future__ import annotations
@@ -262,6 +265,8 @@ def web_research_prompt(question: MetaculusQuestion) -> str:
         - base rates: how often comparable events have happened, and relevant historical or trend data;
         - prices on prediction markets (Polymarket, Kalshi, Manifold) and bookmakers for this event or closely related ones, with the exact contract, price and date; convert betting odds to implied probabilities;
         - forecasts from experts or official projections, if any.
+
+        Write a brief, not a report: at most about 500 words of terse bullets, most decision-relevant facts first, each with its date and a short source link. Skip background the question already states, and say plainly when something (e.g. a market) doesn't exist rather than describing near misses at length.
 
         Question:
         {question.question_text}

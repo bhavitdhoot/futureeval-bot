@@ -309,18 +309,18 @@ def test_budget_scales_with_time_left(monkeypatch):
     monkeypatch.delenv("EXPECTED_QUESTIONS_PER_DAY", raising=False)
     monkeypatch.delenv("SEASON_END_DATE", raising=False)
     # Same balance, different runway: late in the season it can spend freely.
-    # With October 2026 production costs (~$0.10 per high-effort forecast) and
-    # 8 questions a day, $78 in mid-October buys one high-effort forecast, two
-    # on MiniBench...
+    # At the priors (flagship ~$0.30, previous generation ~$0.10 per forecast)
+    # and 8 questions a day, $78 in mid-October buys the previous generation at
+    # high effort, two forecasts on MiniBench...
     tight = botmain.plan_for_budget(78, OCT)
-    assert (tight.main, tight.mini, tight.effort_cap) == (1, 2, None)
-    # ...and $40 only a medium-effort one.
+    assert (tight.main, tight.mini, tight.effort_cap, tight.economy) == (1, 2, None, True)
+    # ...and $40 only the medium-effort last resort.
     lean = botmain.plan_for_budget(40, OCT)
-    assert (lean.main, lean.mini, lean.effort_cap) == (1, 1, "medium")
+    assert (lean.main, lean.mini, lean.effort_cap, lean.economy) == (1, 1, "medium", True)
     assert botmain.plan_for_budget(78, DEC).main >= 2
     # A big top-up unlocks full strength even with a long season left.
     full = botmain.plan_for_budget(800, OCT)
-    assert (full.main, full.mini, full.effort_cap, full.web_research) == (3, 2, None, True)
+    assert (full.main, full.mini, full.effort_cap, full.web_research, full.economy) == (3, 2, None, True, False)
     # Nearly empty always pauses rather than dying mid-question.
     empty = botmain.plan_for_budget(2, DEC)
     assert (empty.main, empty.mini) == (0, 0)
@@ -658,8 +658,9 @@ def test_ledger_measures_rate_share_and_cost():
     assert abs(stats.questions_per_day - 15 / 3) < 1e-9
     assert abs(stats.minibench_share - 3 / 15) < 1e-9
     assert abs(stats.slot_cost[ledger.UNCAPPED] - 0.20) < 1e-9
-    # medium had no data, so it is scaled from uncapped at the priors' ratio
-    assert abs(stats.slot_cost[ledger.MEDIUM] - 0.20 * 0.6) < 1e-9
+    # the economy buckets had no data, so they are scaled at the priors' ratios
+    scale = 0.20 / ledger.PRIOR_SLOT_COST[ledger.UNCAPPED]
+    assert abs(stats.slot_cost[ledger.ECONOMY] - ledger.PRIOR_SLOT_COST[ledger.ECONOMY] * scale) < 1e-9
 
 
 def test_backlog_on_a_fresh_ledger_is_not_counted_as_arrivals():
@@ -716,18 +717,18 @@ def test_ledger_round_trip_prune_and_corruption(tmp_path):
 
 
 def test_plan_follows_measured_costs():
-    cheap = ledger.Stats(8.0, 0.25, {ledger.UNCAPPED: 0.03, ledger.MEDIUM: 0.02}, True)
-    pricey = ledger.Stats(8.0, 0.25, {ledger.UNCAPPED: 0.40, ledger.MEDIUM: 0.25}, True)
+    cheap = ledger.Stats(8.0, 0.25, {ledger.UNCAPPED: 0.03, ledger.ECONOMY: 0.02, ledger.ECONOMY_MEDIUM: 0.01}, True)
+    pricey = ledger.Stats(8.0, 0.25, {ledger.UNCAPPED: 0.40, ledger.ECONOMY: 0.25, ledger.ECONOMY_MEDIUM: 0.15}, True)
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), cheap).main == 3
     plan = botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), pricey)
-    assert (plan.main, plan.mini, plan.effort_cap) == (1, 1, "medium")  # never below coverage
+    assert (plan.main, plan.mini, plan.effort_cap, plan.economy) == (1, 1, "medium", True)  # never below coverage
     # fewer questions than assumed means more per question
-    quiet = ledger.Stats(1.0, 0.25, {ledger.UNCAPPED: 0.10, ledger.MEDIUM: 0.06}, True)
+    quiet = ledger.Stats(1.0, 0.25, dict(ledger.PRIOR_SLOT_COST), True)
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), quiet).main >= 2
 
 
 def test_question_rate_override(monkeypatch):
-    stats = ledger.Stats(1.0, 0.25, {ledger.UNCAPPED: 0.10, ledger.MEDIUM: 0.06}, True)
+    stats = ledger.Stats(1.0, 0.25, dict(ledger.PRIOR_SLOT_COST), True)
     monkeypatch.setenv("EXPECTED_QUESTIONS_PER_DAY", "40")
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), stats).effort_cap == "medium"
 
@@ -849,3 +850,31 @@ def test_research_candidates_resolve_with_online_suffix(monkeypatch):
     monkeypatch.setattr(maintenance, "fetch_available_models", lambda: {"openai/new-search"})
     monkeypatch.setenv("RESEARCH_MODELS", "openrouter/openai/new-search:online|openrouter/openai/old:online")
     assert botmain.research_models() == ["openrouter/openai/new-search:online"]
+
+
+def test_tight_budget_switches_to_previous_generation_at_high_effort():
+    bot = botmain.make_bot(1, publish=False, economy=True)
+    roster = bot.get_llm("default", "llm")
+    assert roster.primaries[0].model == botmain.DEFAULT_ECONOMY[0][0]
+    assert roster.primaries[0].litellm_kwargs["reasoning"] == {"effort": "high"}
+    assert ledger.bucket(True, None) == ledger.ECONOMY and ledger.bucket(False, None) == ledger.UNCAPPED
+
+
+def test_far_out_tails_are_pulled_in_not_discarded():
+    from forecasting_tools import DateQuestion, NumericDistribution, Percentile
+    q = DateQuestion(
+        question_text="When will martial law end?", id_of_post=9, id_of_question=9,
+        page_url="https://www.metaculus.com/questions/9/", resolution_criteria="", fine_print="",
+        background_info="", upper_bound=dt.datetime(2027, 5, 28, tzinfo=dt.timezone.utc),
+        lower_bound=dt.datetime(2022, 5, 29, tzinfo=dt.timezone.utc),
+        open_upper_bound=True, open_lower_bound=False, already_forecasted=False,
+    )
+    years = [2026.9, 2027.1, 2027.5, 2029, 2031, 2034, 2038, 2045]  # the live test's shape
+    pts = [Percentile(percentile=p / 100, value=dt.datetime(int(y), 1 + int((y % 1) * 12), 1, tzinfo=dt.timezone.utc).timestamp())
+           for p, y in zip([5, 10, 20, 40, 60, 80, 90, 95], years)]
+    with pytest.raises(Exception):
+        NumericDistribution.from_question(pts, q)
+    fitted = botmain.fit_to_bounds(pts, q)
+    dist = NumericDistribution.from_question(fitted, q)
+    assert len(dist.get_cdf()) > 100
+    assert fitted[:6] == pts[:6]  # in-range values untouched

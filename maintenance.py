@@ -154,6 +154,7 @@ def configured_model_ids() -> list[str]:
 
     specs = [
         *main._parse_model_list("FORECAST_MODELS", main.DEFAULT_PRIMARY),
+        *main._parse_model_list("ECONOMY_MODELS", main.DEFAULT_ECONOMY),
         *main._parse_model_list("BACKUP_MODELS", main.DEFAULT_BACKUPS),
         *main._parse_model_list("PARSER_MODELS", [(m, None) for m in main.DEFAULT_PARSERS]),
         *[(m, None) for m in (_env_list("RESEARCH_MODELS") or main.DEFAULT_RESEARCH)],

@@ -35,6 +35,7 @@ jobs:
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
           ROSTER_MODE: ${{ vars.ROSTER_MODE }}
           FORECAST_MODELS: ${{ vars.FORECAST_MODELS }}
+          ECONOMY_MODELS: ${{ vars.ECONOMY_MODELS }}
           BACKUP_MODELS: ${{ vars.BACKUP_MODELS }}
           PARSER_MODELS: ${{ vars.PARSER_MODELS }}
           RESEARCH_MODELS: ${{ vars.RESEARCH_MODELS }}

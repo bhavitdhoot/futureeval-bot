@@ -103,6 +103,15 @@ DEFAULT_PRIMARY = [
     ("openrouter/anthropic/claude-opus-5.5|openrouter/anthropic/claude-opus-5|openrouter/anthropic/claude-opus-4.8", "high"),
     ("openrouter/google/gemini-4-argon|openrouter/google/gemini-3.1-pro-preview", "high"),
 ]
+# The roster for tight budgets: the previous generation, proven in production
+# this season at ~$0.10 a question including research. When credits run short
+# the bot drops to these at high effort rather than starve the newest models
+# of reasoning: Metaculus's Spring 2026 analysis found the same prompt at
+# standard effort scored less than half as well as at high effort.
+DEFAULT_ECONOMY = [
+    ("openrouter/openai/gpt-5.6-sol", "high"),
+    ("openrouter/anthropic/claude-opus-4.8", "high"),
+]
 DEFAULT_BACKUPS = [
     ("openrouter/openai/gpt-5.6-sol", "high"),
     ("openrouter/anthropic/claude-opus-4.8", "high"),
@@ -296,8 +305,11 @@ class RosterLlm(GeneralLlm):
         raise RuntimeError("Every model in the chain failed: " + " | ".join(errors))
 
 
-def build_roster(n_predictions: int, effort_cap: str | None = None) -> RosterLlm:
-    primary_specs = _parse_model_list("FORECAST_MODELS", DEFAULT_PRIMARY)
+def build_roster(n_predictions: int, effort_cap: str | None = None, economy: bool = False) -> RosterLlm:
+    if economy:
+        primary_specs = _parse_model_list("ECONOMY_MODELS", DEFAULT_ECONOMY)
+    else:
+        primary_specs = _parse_model_list("FORECAST_MODELS", DEFAULT_PRIMARY)
     backup_specs = _parse_model_list("BACKUP_MODELS", DEFAULT_BACKUPS)
     roster = [make_llm(m, cap_effort(e, effort_cap)) for m, e in primary_specs]
     backups = [make_llm(m, cap_effort(e, effort_cap)) for m, e in backup_specs]
@@ -438,6 +450,33 @@ def repair_percentiles(percentiles: list[Percentile]) -> list[Percentile]:
     return [Percentile(percentile=p, value=v) for p, v in zip(pcts, values)]
 
 
+# The framework rejects a whole distribution if any declared value lies more
+# than twice the question's range beyond a bound.
+_BOUND_MARGIN = 1.9
+
+
+def fit_to_bounds(percentiles: list[Percentile], question) -> list[Percentile]:
+    """
+    Pull tails that run far past the question's range back to just inside the
+    framework's limit, instead of losing the forecast. Seen live: a date
+    question with an open bound in 2027 got 90th/95th percentiles in 2038 and
+    2045. Only the shape far beyond the bound changes; the probability mass
+    beyond it, which is what gets scored, barely moves.
+    """
+    lower, upper = question.lower_bound, question.upper_bound
+    if isinstance(question, DateQuestion):
+        lower, upper = lower.timestamp(), upper.timestamp()
+    span = upper - lower
+    lo, hi = lower - _BOUND_MARGIN * span, upper + _BOUND_MARGIN * span
+    zero_point = getattr(question, "zero_point", None)
+    if zero_point is not None:
+        lo = max(lo, zero_point)
+    fitted = [Percentile(percentile=p.percentile, value=min(max(p.value, lo), hi)) for p in percentiles]
+    if fitted != percentiles:
+        logger.warning(f"Pulled far-out tail values inside the question range: {[p.value for p in percentiles]}")
+    return fitted
+
+
 def pool_binary(predictions: list[float]) -> float:
     """
     Geometric mean of odds, optionally extremized (BINARY_EXTREMIZE, default 1
@@ -526,7 +565,11 @@ class FutureEvalBot(SummerTemplateBot2026):
         prompt = prompts.web_research_prompt(question)
         for model in research_models():
             try:
-                llm = GeneralLlm(model=model, temperature=None, timeout=180, allowed_tries=1)
+                # Low effort: searching and summarising don't need deep
+                # reasoning, and reasoning tokens are billed as output.
+                llm = GeneralLlm(
+                    model=model, temperature=None, timeout=180, allowed_tries=1, reasoning={"effort": "low"}
+                )
                 text = await llm.invoke(prompt)
                 if text and text.strip():
                     return text
@@ -617,7 +660,9 @@ class FutureEvalBot(SummerTemplateBot2026):
                 """
             )
             percentiles = await self._llm_parse(reasoning, list[Percentile], instructions)
-        prediction = NumericDistribution.from_question(repair_percentiles(percentiles), question)
+        prediction = NumericDistribution.from_question(
+            fit_to_bounds(repair_percentiles(percentiles), question), question
+        )
         logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}.")
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
@@ -640,7 +685,9 @@ class FutureEvalBot(SummerTemplateBot2026):
             )
             dates: list[DatePercentile] = await self._llm_parse(reasoning, list[DatePercentile], instructions)
             percentiles = [Percentile(percentile=d.percentile, value=d.value.timestamp()) for d in dates]
-        prediction = NumericDistribution.from_question(repair_percentiles(percentiles), question)
+        prediction = NumericDistribution.from_question(
+            fit_to_bounds(repair_percentiles(percentiles), question), question
+        )
         logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}.")
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
@@ -657,6 +704,7 @@ def make_bot(
     publish: bool,
     effort_cap: str | None = None,
     web_research: bool = True,
+    economy: bool = False,
 ) -> FutureEvalBot:
     use_asknews = asknews_configured()
     # Recorded in each forecast's metadata; run_research picks the sources itself.
@@ -675,7 +723,7 @@ def make_bot(
         extra_metadata_in_explanation=True,
         required_successful_predictions=0.01,  # one surviving model is enough to publish
         llms={
-            "default": build_roster(n_predictions, effort_cap),
+            "default": build_roster(n_predictions, effort_cap, economy),
             "summarizer": parser,  # unused (summaries disabled) but must be set
             "researcher": researcher,
             "parser": parser,
@@ -751,22 +799,26 @@ class Plan:
     effort_cap: str | None  # None = each model's configured reasoning effort
     web_research: bool  # run web search alongside AskNews
     why: str
+    economy: bool = False  # previous-generation roster (DEFAULT_ECONOMY)
 
     @property
     def effort_label(self) -> str:
         """The ledger bucket this plan's spend is filed under."""
-        return self.effort_cap or ledger.UNCAPPED
+        return ledger.bucket(self.economy, self.effort_cap)
 
 
 # Richest first. The planner takes the first one the credits can sustain until
 # the season ends. MiniBench keeps two forecasts longest: it is the tournament
 # Metaculus watches when deciding whether to release more credits.
 PLANS = [
-    (3, 2, None, True, "full strength"),
-    (2, 2, None, True, "two models everywhere"),
-    (1, 2, None, False, "MiniBench keeps the ensemble"),
-    (1, 1, None, False, "one high-effort forecast"),
-    (1, 1, "medium", False, "minimum viable coverage"),
+    # (main, mini, economy roster, effort cap, web research beside AskNews, label)
+    (3, 2, False, None, True, "full strength"),
+    (2, 2, False, None, True, "two flagship models everywhere"),
+    (1, 2, False, None, False, "flagship, MiniBench keeps the ensemble"),
+    (1, 1, False, None, False, "one flagship forecast"),
+    (1, 2, True, None, False, "previous generation, MiniBench keeps the ensemble"),
+    (1, 1, True, None, False, "one previous-generation forecast"),
+    (1, 1, True, "medium", False, "minimum viable coverage"),
 ]
 # The plan is re-chosen every five minutes from the live balance, so running
 # slightly hot corrects itself; this stops it flapping between two plans.
@@ -803,15 +855,16 @@ def plan_for_budget(
     rate = float(_env("EXPECTED_QUESTIONS_PER_DAY") or 0) or stats.questions_per_day
     budget = affordable_per_question(remaining, today or dt.date.today(), rate)
     share = stats.minibench_share
-    for main_n, mini_n, cap, web, label in PLANS:
+    for main_n, mini_n, economy, cap, web, label in PLANS:
         slots = main_n * (1 - share) + mini_n * share
-        cost = stats.slot_cost[cap or ledger.UNCAPPED] * slots
+        key = ledger.bucket(economy, cap)
+        cost = stats.slot_cost.get(key, ledger.PRIOR_SLOT_COST.get(key, 0.0)) * slots
         if cost <= budget * SPEND_SLACK or label == PLANS[-1][-1]:
             note = (
                 f"${remaining:.0f} left, ${budget:.3f} affordable per question at {rate:.1f}/day, "
                 f"this plan ~${cost:.3f} ({stats.why}), {label}"
             )
-            return Plan(main_n, mini_n, cap, web, note)
+            return Plan(main_n, mini_n, cap, web, note, economy)
     raise AssertionError("unreachable: the last plan is always accepted")
 
 
@@ -879,15 +932,16 @@ async def run(mode: str, publish: bool) -> int:
     plan = plan_for_budget(remaining, dt.date.today(), book.stats())
     logger.info(
         f"Budget plan: {plan.main} forecast(s) per tournament question, {plan.mini} per MiniBench "
-        f"question, effort cap {plan.effort_cap or 'none'}, web research "
+        f"question, {'previous-generation' if plan.economy else 'flagship'} models, "
+        f"effort cap {plan.effort_cap or 'none'}, web research "
         f"{'on' if plan.web_research else 'fallback only'} ({plan.why})"
     )
     if plan.main == 0 and plan.mini == 0:
         logger.error("Out of credits: skipping this run. Request more through the Metaculus form.")
         return 0
 
-    main_bot = make_bot(plan.main, publish, plan.effort_cap, plan.web_research)
-    mini_bot = make_bot(plan.mini, publish, plan.effort_cap, plan.web_research)
+    main_bot = make_bot(plan.main, publish, plan.effort_cap, plan.web_research, plan.economy)
+    mini_bot = make_bot(plan.mini, publish, plan.effort_cap, plan.web_research, plan.economy)
 
     if mode == "test_questions":
         main_bot.skip_previously_forecasted_questions = False

@@ -32,12 +32,27 @@ from pathlib import Path
 
 logger = logging.getLogger("ledger")
 
-# Spend buckets. "uncapped" is whatever reasoning effort FORECAST_MODELS
-# configures (high by default); "medium" is the planner's effort cap.
-UNCAPPED, MEDIUM = "uncapped", "medium"
-# Measured in production (Oct 2026): one high-effort GPT forecast plus web
-# research and parsing cost $0.08-0.12 per question.
-PRIOR_SLOT_COST = {UNCAPPED: 0.10, MEDIUM: 0.06}
+# Spend buckets: which roster (flagship or the previous-generation "economy"
+# one) at which effort cap ("uncapped" = whatever is configured, high by
+# default).
+UNCAPPED = "uncapped"
+ECONOMY = "economy"
+ECONOMY_MEDIUM = "economy-medium"
+
+
+def bucket(economy: bool, effort_cap: str | None) -> str:
+    if not economy:
+        return effort_cap or UNCAPPED
+    return f"{ECONOMY}-{effort_cap}" if effort_cap else ECONOMY
+
+
+# Prior cost of one forecast slot, research and parsing included.
+#   flagship: live test on 2026-10-29, GPT-6.1 Sol at high effort with the
+#     then-uncapped research, $0.35 a question (research is now capped, so
+#     this is conservative);
+#   economy: production Oct 2026, GPT-5.6 Sol at high effort, $0.08-0.12;
+#   economy-medium: the usual reasoning-token savings of medium effort.
+PRIOR_SLOT_COST = {UNCAPPED: 0.30, ECONOMY: 0.10, ECONOMY_MEDIUM: 0.06}
 PRIOR_QUESTIONS_PER_DAY = 8.0
 PRIOR_MINIBENCH_SHARE = 0.25
 KEEP_DAYS = 30
@@ -206,12 +221,10 @@ class Ledger:
                 found[bucket] = sum(s["usd"] for s in rows) / slots
                 notes.append(f"${found[bucket]:.3f}/forecast {bucket} measured")
                 measured = True
-        # A bucket without data is scaled from one with data, at the priors' ratio.
-        ratio = PRIOR_SLOT_COST[MEDIUM] / PRIOR_SLOT_COST[UNCAPPED]
+        # Buckets without data are scaled from the ones with data, at the
+        # priors' ratios (averaged when several buckets have data).
         slot_cost = dict(PRIOR_SLOT_COST)
-        slot_cost.update(found)
-        if UNCAPPED in found and MEDIUM not in found:
-            slot_cost[MEDIUM] = found[UNCAPPED] * ratio
-        if MEDIUM in found and UNCAPPED not in found:
-            slot_cost[UNCAPPED] = found[MEDIUM] / ratio
+        if found:
+            scale = sum(found[b] / PRIOR_SLOT_COST[b] for b in found) / len(found)
+            slot_cost = {b: found.get(b, PRIOR_SLOT_COST[b] * scale) for b in PRIOR_SLOT_COST}
         return Stats(rate, share, slot_cost, measured, ", ".join(notes) or "priors only")
