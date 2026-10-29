@@ -300,8 +300,8 @@ def test_main_uses_fresh_targets_file(tmp_path, monkeypatch):
 
 
 # ---------------- budget planning ----------------
-OCT = dt.date(2026, 10, 11)   # 81 days of season left
-DEC = dt.date(2026, 12, 15)   # 16 days left
+OCT = dt.date(2026, 10, 11)   # 70 days of season left
+DEC = dt.date(2026, 12, 4)    # 16 days left
 
 
 def test_budget_scales_with_time_left(monkeypatch):
@@ -335,19 +335,19 @@ def test_budget_scales_with_time_left(monkeypatch):
 
 def test_season_end_rolls_over_and_can_be_overridden(monkeypatch):
     monkeypatch.delenv("SEASON_END_DATE", raising=False)
-    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2026, 12, 31)
-    assert botmain.season_end(dt.date(2027, 2, 1)) == dt.date(2027, 4, 30)
-    assert botmain.season_end(dt.date(2027, 6, 1)) == dt.date(2027, 8, 31)
+    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2026, 12, 20)
+    assert botmain.season_end(dt.date(2027, 2, 1)) == dt.date(2027, 4, 20)
+    assert botmain.season_end(dt.date(2027, 6, 1)) == dt.date(2027, 8, 20)
     monkeypatch.setenv("SEASON_END_DATE", "2027-03-01")
     assert botmain.season_end(dt.date(2027, 2, 1)) == dt.date(2027, 3, 1)
     monkeypatch.setenv("SEASON_END_DATE", "not-a-date")
-    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2026, 12, 31)
+    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2026, 12, 20)
 
 
 def test_end_of_season_does_not_blow_the_budget(monkeypatch):
     # One day before the assumed end, the budget is still spread over a week
     # of questions, not the last day's eight...
-    assert botmain.affordable_per_question(56, dt.date(2026, 12, 30), 8) == 1.0
+    assert botmain.affordable_per_question(56, dt.date(2026, 12, 19), 8) == 1.0
     # ...and the same once an overridden end date has passed but questions keep coming.
     monkeypatch.setenv("SEASON_END_DATE", "2026-12-20")
     assert botmain.affordable_per_question(56, dt.date(2026, 12, 28), 8) == 1.0
@@ -862,7 +862,7 @@ def test_tight_budget_switches_to_previous_generation_at_high_effort():
     flagship = botmain.make_bot(1, publish=False).get_llm("default", "llm")
     assert flagship.primaries[0].litellm_kwargs["max_tokens"] == botmain.MAX_TOKENS
     # today's balance keeps high effort on the previous generation
-    plan = botmain.plan_for_budget(45.87, dt.date(2026, 10, 29))
+    plan = botmain.plan_for_budget(41.55, dt.date(2026, 10, 29))
     assert (plan.main, plan.economy, plan.effort_cap) == (1, True, None)
     assert ledger.bucket(True, None) == ledger.ECONOMY and ledger.bucket(False, None) == ledger.UNCAPPED
 
@@ -971,8 +971,8 @@ def test_cheaper_research_split_buys_bigger_plans():
     all_slot = ledger.Stats(8.0, 0.25, dict(ledger.PRIOR_SLOT_COST), True)
     split = ledger.Stats(8.0, 0.25, {**ledger.PRIOR_SLOT_COST, ledger.ECONOMY: 0.04}, True, research_cost=0.06)
     today = dt.date(2026, 10, 29)
-    assert botmain.plan_for_budget(52, today, all_slot).mini == 1
-    assert botmain.plan_for_budget(52, today, split).mini == 2
+    assert botmain.plan_for_budget(45, today, all_slot).mini == 1
+    assert botmain.plan_for_budget(45, today, split).mini == 2
 
 
 def test_costs_are_logged_and_split(caplog):

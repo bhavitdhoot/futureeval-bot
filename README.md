@@ -60,7 +60,7 @@ Everything below is optional. Set these as repository Variables (Settings, then 
 | `EXTRA_TOURNAMENTS` | unset | Metaculus renames a tournament and the daily check emails you. Paste its ID here. |
 | `CREDIT_FLOOR_USD` | `25` | You want the low-credit warning earlier or later. |
 | `EXPECTED_QUESTIONS_PER_DAY` | measured | Rarely: overrides the question rate the bot measures itself. |
-| `SEASON_END_DATE` | Dec 31 / Apr 30 / Aug 31 | Metaculus announces when the season's last questions open (`YYYY-MM-DD`). |
+| `SEASON_END_DATE` | Dec 20 / Apr 20 / Aug 20 | Metaculus announces when the season's last questions open (`YYYY-MM-DD`). The defaults assume questions stop about ten days before the next season. |
 | `BINARY_EXTREMIZE` | `1` (off) | Only with evidence from resolved questions that the pooled forecasts are underconfident; `1.2` pushes them 20% further from 50% in log-odds. |
 | `MAX_ATTEMPTS_PER_QUESTION` | `3` | Rarely. |
 | `WATCH_MINUTES`, `WATCH_INTERVAL_SECONDS` | `300`, `300` | Rarely. |

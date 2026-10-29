@@ -802,11 +802,13 @@ def main_tournaments(today: dt.date) -> list[int | str]:
 # --------------------------------------------------------------------------
 def season_end(today: dt.date) -> dt.date:
     """
-    Roughly when the current season stops opening questions. Metaculus stops
+    Roughly when the current season stops opening questions: Metaculus stops
     "a few weeks before" the next season starts (Summer 2026 announcement), so
-    the season boundary is a safe upper estimate: assuming too late wastes a
-    little accuracy, assuming too early runs the credits dry while questions
-    are still opening.
+    about ten days before the boundary. Erring a little early is the cheaper
+    mistake under peer scoring: a question the bot misses at the very end
+    scores 0, the same as an average forecast, so it loses only the bot's
+    edge on those few questions, while the extra budget improves every
+    forecast before them. MIN_DAYS_LEFT keeps a reserve if questions continue.
     """
     override = _env("SEASON_END_DATE")
     if override:
@@ -816,10 +818,10 @@ def season_end(today: dt.date) -> dt.date:
             logger.warning(f"Ignoring unparsable SEASON_END_DATE={override!r}")
     season = maintenance.season_of(today)
     if season == "fall":
-        return dt.date(today.year, 12, 31)
+        return dt.date(today.year, 12, 20)
     if season == "spring":
-        return dt.date(today.year, 4, 30)
-    return dt.date(today.year, 8, 31)
+        return dt.date(today.year, 4, 20)
+    return dt.date(today.year, 8, 20)
 
 
 # Never plan as if fewer days remain than this. Near the estimated season end
@@ -1070,6 +1072,8 @@ def log_costs(bot: FutureEvalBot, questions, reports) -> tuple[float, float]:
         if isinstance(r, BaseException):
             continue
         total = float(getattr(r, "price_estimate", 0) or 0)
+        if total <= 0:
+            continue  # cost not reported for this model (litellm may lack it); the balance still counts
         research = min(bot.research_costs.get(question_key(q), 0.0), total)
         research_total += research
         tracked_total += total
