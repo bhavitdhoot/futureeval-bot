@@ -16,9 +16,9 @@ the Actions cache (see .github/workflows/forecast.yaml); locally it just sits
 in .ledger/. Losing it is harmless: the planner falls back to priors measured
 in October 2026 production runs.
 
-Known approximation: a batch's cost is spread evenly over its forecast slots,
-although research is a fixed cost per question. Plans with more slots per
-question therefore look slightly cheaper per slot than plans with fewer.
+Research is a fixed cost per question, so where per-call cost reports show
+how much of a batch went on research, that part is priced per question and
+only the rest per forecast slot.
 """
 
 from __future__ import annotations
@@ -106,9 +106,14 @@ def _valid_spend(s) -> bool:
 class Stats:
     questions_per_day: float
     minibench_share: float
-    slot_cost: dict[str, float]
+    slot_cost: dict[str, float]  # per forecast slot, research excluded when measured
     measured: bool  # False when every number is a prior
     why: str = ""
+    research_cost: float = 0.0  # per question; 0 while research is folded into slot_cost
+
+    def plan_cost(self, bucket_name: str, slots: float) -> float:
+        cost = self.slot_cost.get(bucket_name, PRIOR_SLOT_COST.get(bucket_name, float("inf")))
+        return self.research_cost + cost * slots
 
 
 @dataclass
@@ -173,19 +178,31 @@ class Ledger:
             self.seen[key] = {"tournament": str(tournament), "first_seen": (now or _now()).isoformat()}
 
     def record_spend(
-        self, effort: str, slots: int, questions: int, usd: float, now: dt.datetime | None = None
+        self,
+        effort: str,
+        slots: int,
+        questions: int,
+        usd: float,
+        now: dt.datetime | None = None,
+        research_share: float | None = None,
     ) -> None:
+        """
+        `usd` is the balance drop (authoritative total). `research_share` is
+        the fraction of it that went on research, from per-call cost reports,
+        when known: research is a fixed cost per question, not per forecast.
+        """
         if questions <= 0 or slots <= 0:
             return
-        self.spend.append(
-            {
-                "ts": (now or _now()).isoformat(),
-                "effort": effort,
-                "slots": slots,
-                "questions": questions,
-                "usd": round(max(usd, 0.0), 5),
-            }
-        )
+        row = {
+            "ts": (now or _now()).isoformat(),
+            "effort": effort,
+            "slots": slots,
+            "questions": questions,
+            "usd": round(max(usd, 0.0), 5),
+        }
+        if research_share is not None and 0 <= research_share <= 1:
+            row["research_share"] = round(research_share, 4)
+        self.spend.append(row)
 
     def add_late_charges(self, usd: float) -> None:
         """
@@ -218,6 +235,25 @@ class Ledger:
         else:
             rate, share = PRIOR_QUESTIONS_PER_DAY, PRIOR_MINIBENCH_SHARE
 
+        # Research is a fixed cost per question. Where rows say how much of
+        # their spend it was, take it out of the per-slot cost and price it per
+        # question, so multi-forecast plans aren't overpriced.
+        split_rows = [s for s in self.spend if "research_share" in s][-COST_WINDOW:]
+        research_cost = 0.0
+        if sum(s["questions"] for s in split_rows) >= 3:
+            research_cost = sum(s["usd"] * s["research_share"] for s in split_rows) / sum(
+                s["questions"] for s in split_rows
+            )
+            notes.append(f"${research_cost:.3f}/question research measured")
+            measured = True
+
+        def slot_usd(s: dict) -> float:
+            if "research_share" in s:
+                return s["usd"] * (1 - s["research_share"])
+            if research_cost:
+                return max(s["usd"] - research_cost * s["questions"], 0.0)
+            return s["usd"]
+
         found = {}
         for name in PRIOR_SLOT_COST:
             rows = [s for s in self.spend if s["effort"] == name][-COST_WINDOW:]
@@ -226,7 +262,7 @@ class Ledger:
             # during the next batch moves cost between neighbouring batches but
             # not out of the total.
             if slots >= 3:
-                found[name] = sum(s["usd"] for s in rows) / slots
+                found[name] = sum(slot_usd(s) for s in rows) / slots
                 notes.append(f"${found[name]:.3f}/forecast {name} measured")
                 measured = True
         # Buckets without data are scaled from the ones with data, at the
@@ -235,4 +271,4 @@ class Ledger:
         if found:
             scale = sum(found[b] / PRIOR_SLOT_COST[b] for b in found) / len(found)
             slot_cost = {b: found.get(b, PRIOR_SLOT_COST[b] * scale) for b in PRIOR_SLOT_COST}
-        return Stats(rate, share, slot_cost, measured, ", ".join(notes) or "priors only")
+        return Stats(rate, share, slot_cost, measured, ", ".join(notes) or "priors only", research_cost)

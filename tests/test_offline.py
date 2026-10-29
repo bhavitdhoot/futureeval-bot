@@ -940,3 +940,57 @@ def test_research_retries_without_reasoning_if_rejected(monkeypatch):
     monkeypatch.setattr(GeneralLlm, "invoke", picky)
     text = run(botmain.make_bot(1, publish=False)._web_research(binary_q()))
     assert text == "news" and attempts == [True, False]
+
+
+# ---------------- exact costs and the research/forecast split ----------------
+def test_research_is_priced_per_question_not_per_forecast():
+    book = fresh_book()
+    # $0.25 a question at one forecast each, 60% of it research
+    for _ in range(5):
+        book.record_spend(ledger.ECONOMY, 1, 1, 0.25, NOW, research_share=0.6)
+    stats = book.stats(NOW)
+    assert abs(stats.research_cost - 0.15) < 1e-9
+    assert abs(stats.slot_cost[ledger.ECONOMY] - 0.10) < 1e-9
+    # two forecasts cost one research plus two forecasts, not twice the total
+    assert abs(stats.plan_cost(ledger.ECONOMY, 2) - 0.35) < 1e-9
+    # rows without a split have the measured research taken out of them
+    book.record_spend(ledger.ECONOMY, 1, 1, 0.25, NOW)
+    assert abs(book.stats(NOW).slot_cost[ledger.ECONOMY] - 0.10) < 1e-9
+
+
+def test_plan_without_split_data_keeps_the_old_pricing():
+    stats = ledger.Ledger().stats(NOW)
+    assert stats.research_cost == 0
+    assert stats.plan_cost(ledger.ECONOMY, 2) == 2 * ledger.PRIOR_SLOT_COST[ledger.ECONOMY]
+    assert stats.plan_cost("no-such-bucket", 1) == float("inf")
+
+
+def test_cheaper_research_split_buys_bigger_plans():
+    # Same total spend per single-forecast question, but most of it research:
+    # a second forecast is cheap, so the planner can afford MiniBench's pair.
+    all_slot = ledger.Stats(8.0, 0.25, dict(ledger.PRIOR_SLOT_COST), True)
+    split = ledger.Stats(8.0, 0.25, {**ledger.PRIOR_SLOT_COST, ledger.ECONOMY: 0.04}, True, research_cost=0.06)
+    today = dt.date(2026, 10, 29)
+    assert botmain.plan_for_budget(52, today, all_slot).mini == 1
+    assert botmain.plan_for_budget(52, today, split).mini == 2
+
+
+def test_costs_are_logged_and_split(caplog):
+    bot = botmain.make_bot(1, publish=False)
+    q1, q2 = binary_q_n(51), binary_q_n(52)
+    bot.research_costs = {"51": 0.05}
+
+    class Report:
+        def __init__(self, price):
+            self.price_estimate = price
+
+    with caplog.at_level("INFO", logger="forecast-bot"):
+        research, total = botmain.log_costs(bot, [q1, q2, binary_q_n(53)], [Report(0.20), Report(0.10), RuntimeError()])
+    assert (round(research, 3), round(total, 3)) == (0.05, 0.30)
+    assert "research $0.050, forecasting $0.150" in caplog.text
+
+
+def test_research_cost_is_tracked_per_question():
+    bot = botmain.make_bot(1, publish=False)
+    run(bot.run_research(binary_q_n(61)))
+    assert "61" in bot.research_costs

@@ -73,6 +73,9 @@ from forecasting_tools import (  # noqa: E402
     clean_indents,
     structure_output,
 )
+from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (  # noqa: E402
+    MonetaryCostManager,
+)
 from forecasting_tools.data_models.questions import MetaculusQuestion  # noqa: E402
 
 import ledger  # noqa: E402
@@ -542,6 +545,7 @@ class FutureEvalBot(SummerTemplateBot2026):
     # Set by make_bot. Kept off __init__ because the framework builds each
     # forecast's published config from the __init__ signature.
     use_asknews = False
+    research_costs: dict[str, float]  # question key -> USD, set per bot in make_bot
     # With AskNews configured, also run web search (news alone misses base
     # rates, official data and schedules). Without AskNews, web search is the
     # only source and always runs.
@@ -549,6 +553,15 @@ class FutureEvalBot(SummerTemplateBot2026):
 
     # ------------------------------ research ------------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
+        # Exact research cost (OpenRouter reports each call's cost; the
+        # manager is per task, so concurrent questions don't mix). Feeds the
+        # ledger's research/forecast split.
+        with MonetaryCostManager() as cost:
+            research = await self._run_research(question)
+        self.research_costs[question_key(question)] = self.research_costs.get(question_key(question), 0.0) + cost.current_usage
+        return research
+
+    async def _run_research(self, question: MetaculusQuestion) -> str:
         jobs = {}
         if self.use_asknews:
             jobs["Recent news (AskNews)"] = self._asknews_research(question)
@@ -758,6 +771,7 @@ def make_bot(
     )
     bot.use_asknews = use_asknews
     bot.web_research = web_research
+    bot.research_costs = {}
     return bot
 
 
@@ -888,7 +902,7 @@ def plan_for_budget(
         slots = main_n * (1 - share) + mini_n * share
         key = ledger.bucket(economy, cap)
         # A bucket with no measurement and no prior is treated as unaffordable.
-        cost = stats.slot_cost.get(key, ledger.PRIOR_SLOT_COST.get(key, math.inf)) * slots
+        cost = stats.plan_cost(key, slots)
         if cost <= budget * SPEND_SLACK or label == PLANS[-1][-1]:
             note = (
                 f"${remaining:.0f} left, ${budget:.3f} affordable per question at {rate:.1f}/day, "
@@ -1011,9 +1025,11 @@ async def run(mode: str, publish: bool) -> int:
         # reports line up one-to-one with questions.
         reports = await bot.forecast_questions(questions, return_exceptions=True)
         after = maintenance.fetch_credits_remaining() if live else None
+        research_usd, tracked_usd = log_costs(bot, questions, reports)
         if before is not None and after is not None:
             slots = plan.mini if bot is mini_bot else plan.main
-            book.record_spend(plan.effort_label, slots, len(questions), before - after)
+            share = research_usd / tracked_usd if tracked_usd > 0 else None
+            book.record_spend(plan.effort_label, slots, len(questions), before - after, research_share=share)
             _balance_mark = after
         for q, r in zip(questions, reports):
             if isinstance(r, BaseException):
@@ -1041,6 +1057,26 @@ async def run(mode: str, publish: bool) -> int:
     # breakage: something failed and nothing succeeded. Isolated failures are
     # retried automatically on the next cycles.
     return 1 if failures and not successes else 0
+
+
+def log_costs(bot: FutureEvalBot, questions, reports) -> tuple[float, float]:
+    """
+    Log each question's exact cost, split into research and forecasting
+    (from OpenRouter's per-call cost reports). Returns (research, total) USD
+    over the questions that produced a report.
+    """
+    research_total = tracked_total = 0.0
+    for q, r in zip(questions, reports):
+        if isinstance(r, BaseException):
+            continue
+        total = float(getattr(r, "price_estimate", 0) or 0)
+        research = min(bot.research_costs.get(question_key(q), 0.0), total)
+        research_total += research
+        tracked_total += total
+        logger.info(
+            f"Cost for {q.page_url}: ${total:.3f} (research ${research:.3f}, forecasting ${total - research:.3f})"
+        )
+    return research_total, tracked_total
 
 
 async def _safe_run(mode: str, publish: bool) -> int:
