@@ -10,7 +10,7 @@ Seasons start in January, May and September and run about four months. Around ea
 
 **3. Renew AskNews.** Metaculus says bot accounts must renew their AskNews allocation each season, using the same process as setup. Skip this if you didn't set up AskNews.
 
-**4. Optional: refresh the models.** When OpenAI or Anthropic release a new flagship, set the repository variable `FORECAST_MODELS` to the new slugs (format in README.md), before the new season's first questions. Check the exact slugs on openrouter.ai/models. Old models keep working for a while and backups cover retirements, so this is an accuracy upgrade, not a repair. If you'd rather not, ask Claude to look up the current slugs for you.
+**4. Optional: refresh the model candidates.** The bot already switches to the newest model in each slot that OpenRouter lists, but only among the candidates named in `main.py` (`DEFAULT_PRIMARY`). When a new flagship comes out under a new name, add its slug to the front of that slot, or set the repository variable `FORECAST_MODELS` (format in README.md). Check the exact slugs on openrouter.ai/models. The forecast log's "Model slot ... ->" lines show which model each slot is actually using.
 
 ## If you win a prize
 
