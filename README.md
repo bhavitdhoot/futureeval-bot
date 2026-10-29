@@ -53,6 +53,7 @@ Everything below is optional. Set these as repository Variables (Settings, then 
 | `ROSTER_MODE` | `auto` (sized to the credit balance) | Set to `full` if you have plenty of credits (three forecasts per main question, two per MiniBench question), or `lean` for a fixed two and one. |
 | `SKIP_MINIBENCH` | unset | Set to `true` to save credits for the main tournament. |
 | `FORECAST_MODELS` | GPT Sol, Claude Opus, Gemini Pro candidates (see `main.py`) | You want different models. Format is `slug:effort`, comma-separated; `slugA|slugB:effort` means "the first of these OpenRouter lists". |
+| `ECONOMY_MODELS` | `gpt-5.6-sol`, `claude-opus-4.8` (high) | Rarely: the cheaper roster used when credits are tight. |
 | `BACKUP_MODELS` | `gpt-5.6-sol`, `claude-opus-4.8`, `gpt-5.5` (all high) | Rarely. |
 | `PARSER_MODELS` | `gpt-4.1-mini`, `gpt-5.6-luna`, `gpt-4o-mini` | Rarely. |
 | `RESEARCH_MODELS` | `gpt-5.6-terra:online`, `gpt-5.6-sol:online` | A web-search model is retired. |
@@ -70,17 +71,19 @@ The donated Metaculus OpenRouter key only works with OpenAI, Anthropic and Googl
 
 The bot spends what the credits can sustain until the season ends, and no more. It keeps a small ledger (`ledger.py`, carried between runs in the GitHub Actions cache) of what each forecast actually cost and how often questions actually open. Every five minutes it picks the richest plan the remaining balance can pay for at that rate:
 
-| Plan | Main tournament | MiniBench | Web research beside AskNews |
-|---|---|---|---|
-| full strength | 3 forecasts | 2 | yes |
-| two models everywhere | 2 | 2 | yes |
-| MiniBench keeps the ensemble | 1 | 2 | no |
-| one high-effort forecast | 1 | 1 | no |
-| minimum viable coverage | 1 at medium effort | 1 at medium effort | no |
+| Plan | Models | Main tournament | MiniBench | Web research beside AskNews |
+|---|---|---|---|---|
+| full strength | newest | 3 forecasts | 2 | yes |
+| two flagship models everywhere | newest | 2 | 2 | yes |
+| flagship, MiniBench keeps the ensemble | newest | 1 | 2 | no |
+| one flagship forecast | newest | 1 | 1 | no |
+| previous generation, MiniBench keeps the ensemble | previous | 1 | 2 | no |
+| one previous-generation forecast | previous | 1 | 1 | no |
+| minimum viable coverage | previous, medium effort | 1 | 1 | no |
 
-MiniBench keeps two forecasts longest, because its results decide whether Metaculus releases more credits. Below $6 the bot pauses rather than leave runs half finished. Topping up the key moves it up the table automatically. Each forecast run logs the plan it chose and why.
+All plans run at high reasoning effort except the last. When money is short the bot steps down a model generation (to `gpt-5.6-sol` / `claude-opus-4.8`, set with `ECONOMY_MODELS`) before it cuts reasoning effort, because Metaculus's Spring 2026 analysis tied effort strongly to score. MiniBench keeps two forecasts longest, because its results decide whether Metaculus releases more credits. Below $6 the bot pauses rather than leave runs half finished. Topping up the key moves it up the table automatically. Each forecast run logs the plan it chose and why.
 
-Measured in October 2026: the seasonal tournament opens about 8 questions a day, one at a time, and one high-effort forecast with web research costs about $0.10. At that rate $50 covers about two months with one forecast per question. If you set up AskNews (free; see SETUP.md), research stops costing credits whenever it finds news, leaving more for forecasting.
+Measured in October 2026: the seasonal tournament opens about 8 questions a day, one at a time. One high-effort forecast with web research cost about $0.10 on the previous generation (production) and about $0.35 on GPT-6.1 Sol before research was capped (live test). So about $50 for the last two months of a season means the previous generation; about $150 or more buys the newest models. If you set up AskNews (free; see SETUP.md), research stops costing credits whenever it finds news, leaving more for forecasting.
 
 ## Credits
 
