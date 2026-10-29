@@ -14,7 +14,7 @@ The bot is built on the official [Metaculus template bot](https://github.com/Met
 
 **Prompts** (`prompts.py`). These are rewritten from the template's. Each prompt states when the question closes and resolves and how many days away that is (the template asked models to estimate "time left" without giving them the date). The model works through resolution mechanics, time left, the status quo, a reference-class base rate, the evidence, and scenarios on both sides. Calibration guidance cuts both ways: weight the status quo, but don't hedge on outcomes that are effectively decided. Where a liquid prediction market or bookmaker prices the event, that price is the anchor, and the research step looks for one. Numeric and date prompts ask for the 5th to 95th percentiles and remind the model that one outcome in five should land outside its 10th–90th range.
 
-**Forecasting** uses a two-vendor roster: `openai/gpt-5.6-sol` and `anthropic/claude-opus-4.8`, both at high reasoning effort, routed through OpenRouter. How many forecasts each question gets depends on the credit balance (see "Rough credit use" below). Model choice and reasoning effort were the features most associated with rank in Metaculus's own Spring 2026 analysis: the template prompt with a frontier high-reasoning model placed 18th of 173, while the same prompt at standard effort scored less than half as well.
+**Forecasting** uses a three-vendor roster at high reasoning effort, routed through OpenRouter: OpenAI's GPT Sol, Anthropic's Claude Opus and Google's Gemini Pro. Each slot lists candidate models newest first, and the bot uses the newest one OpenRouter currently lists (as of October 2026: GPT-6.1/6 Sol, Claude Opus 5.5, Gemini 4 Argon), falling back to the models verified in production this season (`gpt-5.6-sol`, `claude-opus-4.8`) if it can't tell. New releases are picked up without code changes. Three vendors rather than repeats of one, because an ensemble gains most from members that make different mistakes. How many forecasts each question gets depends on the credit balance (see "Rough credit use" below). Model choice and reasoning effort were the features most associated with rank in Metaculus's own Spring 2026 analysis: the template prompt with a frontier high-reasoning model placed 18th of 173, while the same prompt at standard effort scored less than half as well.
 
 **Parsing.** Final answers are parsed directly from the requested format ("Probability: 23%", "Percentile 10: 4.5"). An LLM parser is only used when an answer strays from that format. Percentiles listed in the wrong order are sorted rather than discarded.
 
@@ -22,7 +22,7 @@ The bot is built on the official [Metaculus template bot](https://github.com/Met
 
 Reliability is treated as part of accuracy, because a skipped question scores zero:
 
-- Every model call has a fallback chain. If a model errors or returns nothing, the call goes to the other vendor's model, then to backup models (`gpt-5.5`, `claude-opus-4.7`, `gpt-5.6-luna`). An answer with no final forecast in it gets one retry on the next model.
+- Every model call has a fallback chain. If a model errors or returns nothing, the call goes to the other vendor's model, then to backup models (`gpt-5.6-sol`, `claude-opus-4.8`, `gpt-5.5`). An answer with no final forecast in it gets one retry on the next model.
 - The parser has its own fallback chain.
 - A question publishes as long as at least one model succeeds.
 - A forecast run keeps polling for new questions every 5 minutes. A failed question is retried on later polls, up to 3 attempts per run, so a question that fails for a persistent reason can't drain credits.
@@ -52,8 +52,8 @@ Everything below is optional. Set these as repository Variables (Settings, then 
 |---|---|---|
 | `ROSTER_MODE` | `auto` (sized to the credit balance) | Set to `full` if you have plenty of credits (three forecasts per main question, two per MiniBench question), or `lean` for a fixed two and one. |
 | `SKIP_MINIBENCH` | unset | Set to `true` to save credits for the main tournament. |
-| `FORECAST_MODELS` | `openrouter/openai/gpt-5.6-sol:high,openrouter/anthropic/claude-opus-4.8:high` | New flagship models come out. Format is `slug:effort`, comma-separated. |
-| `BACKUP_MODELS` | `gpt-5.5`, `claude-opus-4.7`, `gpt-5.6-luna` (all high) | Rarely. |
+| `FORECAST_MODELS` | GPT Sol, Claude Opus, Gemini Pro candidates (see `main.py`) | You want different models. Format is `slug:effort`, comma-separated; `slugA|slugB:effort` means "the first of these OpenRouter lists". |
+| `BACKUP_MODELS` | `gpt-5.6-sol`, `claude-opus-4.8`, `gpt-5.5` (all high) | Rarely. |
 | `PARSER_MODELS` | `gpt-4.1-mini`, `gpt-5.6-luna`, `gpt-4o-mini` | Rarely. |
 | `RESEARCH_MODELS` | `gpt-5.6-terra:online`, `gpt-5.6-sol:online` | A web-search model is retired. |
 | `EXTRA_TOURNAMENTS` | unset | Metaculus renames a tournament and the daily check emails you. Paste its ID here. |
