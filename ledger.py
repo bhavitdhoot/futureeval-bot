@@ -50,7 +50,8 @@ def bucket(economy: bool, effort_cap: str | None) -> str:
 #   flagship: live test on 2026-10-29, GPT-6.1 Sol at high effort with the
 #     then-uncapped research, $0.35 a question (research is now capped, so
 #     this is conservative);
-#   economy: production Oct 2026, GPT-5.6 Sol at high effort, $0.08-0.12;
+#   economy: production Oct 2026, GPT-5.6 Sol at high effort with an 8k token
+#     cap, $0.08-0.12 (the economy tiers cap at 10k);
 #   economy-medium: the usual reasoning-token savings of medium effort.
 PRIOR_SLOT_COST = {UNCAPPED: 0.30, ECONOMY: 0.10, ECONOMY_MEDIUM: 0.06}
 PRIOR_QUESTIONS_PER_DAY = 8.0

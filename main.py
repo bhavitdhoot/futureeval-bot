@@ -136,10 +136,14 @@ DEFAULT_RESEARCH = [
 # Reasoning efforts OpenRouter accepts, weakest first.
 EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"]
 
-# Never cap output below this. Reasoning tokens count toward max_tokens, so a
-# low cap at high effort can spend the whole budget thinking and return no
-# answer: the call is paid for and the forecast is lost.
+# Output cap per call. Reasoning tokens count toward it, so it is also the
+# main cost lever: in a live test the previous generation at high effort cost
+# $0.26 a question with 32k against $0.08-0.12 in production at 8k, with the
+# same research. A cap that's too low truncates the answer instead (the
+# roster then retries once and the parser gets the rest), so budget tiers use
+# ECONOMY_MAX_TOKENS, 25% above production's proven 8k.
 MAX_TOKENS = 32000
+ECONOMY_MAX_TOKENS = 10000
 
 
 def _env(name: str) -> str:
@@ -305,14 +309,19 @@ class RosterLlm(GeneralLlm):
         raise RuntimeError("Every model in the chain failed: " + " | ".join(errors))
 
 
-def build_roster(n_predictions: int, effort_cap: str | None = None, economy: bool = False) -> RosterLlm:
+def build_roster(
+    n_predictions: int,
+    effort_cap: str | None = None,
+    economy: bool = False,
+    max_tokens: int = MAX_TOKENS,
+) -> RosterLlm:
     if economy:
         primary_specs = _parse_model_list("ECONOMY_MODELS", DEFAULT_ECONOMY)
     else:
         primary_specs = _parse_model_list("FORECAST_MODELS", DEFAULT_PRIMARY)
     backup_specs = _parse_model_list("BACKUP_MODELS", DEFAULT_BACKUPS)
-    roster = [make_llm(m, cap_effort(e, effort_cap)) for m, e in primary_specs]
-    backups = [make_llm(m, cap_effort(e, effort_cap)) for m, e in backup_specs]
+    roster = [make_llm(m, cap_effort(e, effort_cap), max_tokens=max_tokens) for m, e in primary_specs]
+    backups = [make_llm(m, cap_effort(e, effort_cap), max_tokens=max_tokens) for m, e in backup_specs]
     n = max(n_predictions, 1)
     # "full" mode can ask for more predictions than roster members; repeat in order.
     primaries = [roster[i % len(roster)] for i in range(n)]
@@ -723,7 +732,9 @@ def make_bot(
         extra_metadata_in_explanation=True,
         required_successful_predictions=0.01,  # one surviving model is enough to publish
         llms={
-            "default": build_roster(n_predictions, effort_cap, economy),
+            "default": build_roster(
+                n_predictions, effort_cap, economy, ECONOMY_MAX_TOKENS if economy else MAX_TOKENS
+            ),
             "summarizer": parser,  # unused (summaries disabled) but must be set
             "researcher": researcher,
             "parser": parser,
@@ -834,9 +845,9 @@ def plan_for_budget(
 
     Costs and the question rate come from the ledger (measured), or from
     priors taken from production runs until enough has been measured. Savings
-    come from fewer forecasts and lower reasoning effort, never from a lower
-    max_tokens: a capped reasoning model can run out of tokens before writing
-    its answer, which wastes the whole call.
+    come first from fewer forecasts, then from the previous model generation
+    (with a tighter token cap, see ECONOMY_MAX_TOKENS), and only last from
+    lower reasoning effort.
     """
     mode = _env("ROSTER_MODE").lower() or "auto"
     if mode == "full":

@@ -857,6 +857,12 @@ def test_tight_budget_switches_to_previous_generation_at_high_effort():
     roster = bot.get_llm("default", "llm")
     assert roster.primaries[0].model == botmain.DEFAULT_ECONOMY[0][0]
     assert roster.primaries[0].litellm_kwargs["reasoning"] == {"effort": "high"}
+    assert all(m.litellm_kwargs["max_tokens"] == botmain.ECONOMY_MAX_TOKENS for m in roster.primaries + roster.backups)
+    flagship = botmain.make_bot(1, publish=False).get_llm("default", "llm")
+    assert flagship.primaries[0].litellm_kwargs["max_tokens"] == botmain.MAX_TOKENS
+    # today's balance keeps high effort on the previous generation
+    plan = botmain.plan_for_budget(45.87, dt.date(2026, 10, 29))
+    assert (plan.main, plan.economy, plan.effort_cap) == (1, True, None)
     assert ledger.bucket(True, None) == ledger.ECONOMY and ledger.bucket(False, None) == ledger.UNCAPPED
 
 
