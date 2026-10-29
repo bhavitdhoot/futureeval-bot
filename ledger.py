@@ -63,6 +63,9 @@ MIN_RATE_DAYS = 2  # measure the question rate only over at least this long
 # they are a backlog, not arrivals, and would inflate the rate if counted.
 BASELINE = dt.timedelta(minutes=30)
 COST_WINDOW = 25  # most recent spend records used per bucket
+# Bump when what a spend bucket means changes (e.g. which roster it measures);
+# spend rows from another version are dropped on load, question sightings kept.
+SCHEMA_VERSION = 2
 
 
 def ledger_path() -> Path:
@@ -130,6 +133,10 @@ class Ledger:
             return cls()
         seen = data.get("seen") if isinstance(data.get("seen"), dict) else {}
         spend = data.get("spend") if isinstance(data.get("spend"), list) else []
+        if data.get("version") != SCHEMA_VERSION:
+            if spend:
+                logger.warning(f"Ledger {path} is from another schema version; discarding its spend records")
+            spend = []
         book = cls(
             seen={str(k): v for k, v in seen.items() if _valid_seen(v)},
             spend=[s for s in spend if _valid_spend(s)],
@@ -149,7 +156,7 @@ class Ledger:
             self.prune(now)
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
-            payload = {"created": self.created, "seen": self.seen, "spend": self.spend}
+            payload = {"version": SCHEMA_VERSION, "created": self.created, "seen": self.seen, "spend": self.spend}
             tmp.write_text(json.dumps(payload, indent=1))
             tmp.replace(path)
         except Exception as e:  # noqa: BLE001
@@ -212,15 +219,15 @@ class Ledger:
             rate, share = PRIOR_QUESTIONS_PER_DAY, PRIOR_MINIBENCH_SHARE
 
         found = {}
-        for bucket in PRIOR_SLOT_COST:
-            rows = [s for s in self.spend if s["effort"] == bucket][-COST_WINDOW:]
+        for name in PRIOR_SLOT_COST:
+            rows = [s for s in self.spend if s["effort"] == name][-COST_WINDOW:]
             slots = sum(s["slots"] * s["questions"] for s in rows)
             # Totals, not a median of per-batch costs: a charge that posts
             # during the next batch moves cost between neighbouring batches but
             # not out of the total.
             if slots >= 3:
-                found[bucket] = sum(s["usd"] for s in rows) / slots
-                notes.append(f"${found[bucket]:.3f}/forecast {bucket} measured")
+                found[name] = sum(s["usd"] for s in rows) / slots
+                notes.append(f"${found[name]:.3f}/forecast {name} measured")
                 measured = True
         # Buckets without data are scaled from the ones with data, at the
         # priors' ratios (averaged when several buckets have data).

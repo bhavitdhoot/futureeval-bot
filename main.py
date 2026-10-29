@@ -88,13 +88,11 @@ logger = logging.getLogger("forecast-bot")
 MINIBENCH = "minibench"
 TEST_AREA = "bot-testing-area"
 
-# Each roster slot lists candidates newest first, separated by "|"; the bot
-# uses the first one OpenRouter currently lists (see resolve_model), and the
-# last one, verified in production, if the catalog can't be read. So a newer
-# model is picked up the day it appears, and a wrong guess costs nothing.
-# Candidates as of October 2026: Claude Opus 5.5 and the GPT-6 / Gemini 4
-# names come from OpenRouter's migration guides and listings; gpt-5.6-sol and
-# claude-opus-4.8 ran in production this season.
+# Each roster slot lists candidates in order of preference, separated by "|";
+# the bot uses the first one OpenRouter currently lists (see resolve_model).
+# Put a newer model in front and it is picked up the day it is listed; the
+# others are what the slot falls back to if it is retired. The first
+# candidates below were all listed on OpenRouter in a live run on 2026-10-29.
 # Three vendors, because an ensemble gains most from members that err
 # differently ("Diversity is the Strength of the AI Crowd", 2026); with fewer
 # forecasts per question the later slots are the first fallbacks.
@@ -151,26 +149,36 @@ def _env(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
+# OpenRouter's catalog, read once per process; a failed read is retried after
+# CATALOG_RETRY_SECONDS rather than pinning a 5-hour job to the fallbacks.
 _catalog_cache: set[str] | None = None
-_catalog_read = False
+_catalog_read_at: float | None = None
+CATALOG_RETRY_SECONDS = 600
 _resolved_logged: set[str] = set()
 
 
 def _catalog() -> set[str] | None:
-    """OpenRouter's public model list, read once per process. None if unreadable."""
-    global _catalog_cache, _catalog_read
-    if not _catalog_read:
-        _catalog_read = True
+    """OpenRouter's public model list. None if it can't be read right now."""
+    global _catalog_cache, _catalog_read_at
+    stale = _catalog_read_at is None or (
+        _catalog_cache is None and time.monotonic() - _catalog_read_at >= CATALOG_RETRY_SECONDS
+    )
+    if stale:
+        _catalog_read_at = time.monotonic()
         _catalog_cache = maintenance.fetch_available_models()
     return _catalog_cache
 
 
 def resolve_model(spec: str) -> str:
-    """The first candidate in "a|b|c" that OpenRouter lists, else the last (known-good) one."""
+    """
+    The first candidate in "a|b|c" that OpenRouter lists. If the catalog can't
+    be read (or lists none of them), the first candidate: it is the preferred
+    one, and if it fails at call time the roster's fallback chain takes over.
+    """
     candidates = [c.strip() for c in spec.split("|") if c.strip()]
     if len(candidates) <= 1:
         return candidates[0] if candidates else spec
-    chosen = candidates[-1]
+    chosen = candidates[0]
     available = _catalog()
     if available:
         listed = [c for c in candidates if maintenance.openrouter_id(c) in available]
@@ -184,9 +192,13 @@ def resolve_model(spec: str) -> str:
     return chosen
 
 
+def research_model_specs() -> list[str]:
+    """RESEARCH_MODELS as configured, candidates unresolved."""
+    return [m.strip() for m in _env("RESEARCH_MODELS").split(",") if m.strip()] or DEFAULT_RESEARCH
+
+
 def research_models() -> list[str]:
-    raw = [m.strip() for m in _env("RESEARCH_MODELS").split(",") if m.strip()] or DEFAULT_RESEARCH
-    return [resolve_model(m) for m in raw]
+    return [resolve_model(m) for m in research_model_specs()]
 
 
 def _parse_model_list(env_name: str, default: list[tuple[str, str | None]]):
@@ -573,18 +585,22 @@ class FutureEvalBot(SummerTemplateBot2026):
     async def _web_research_unthrottled(self, question: MetaculusQuestion) -> str:
         prompt = prompts.web_research_prompt(question)
         for model in research_models():
-            try:
-                # Low effort: searching and summarising don't need deep
-                # reasoning, and reasoning tokens are billed as output.
-                llm = GeneralLlm(
-                    model=model, temperature=None, timeout=180, allowed_tries=1, reasoning={"effort": "low"}
-                )
-                text = await llm.invoke(prompt)
-                if text and text.strip():
-                    return text
-                logger.warning(f"Web research {model} returned nothing")
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"Web research {model} failed: {type(e).__name__}: {e}")
+            # Low effort: searching and summarising don't need deep reasoning,
+            # and reasoning tokens are billed as output. Retried without the
+            # parameter if a (non-reasoning) model rejects it.
+            for reasoning in ({"effort": "low"}, None):
+                extra = {"reasoning": reasoning} if reasoning else {}
+                try:
+                    llm = GeneralLlm(model=model, temperature=None, timeout=180, allowed_tries=1, **extra)
+                    text = await llm.invoke(prompt)
+                    if text and text.strip():
+                        return text
+                    logger.warning(f"Web research {model} returned nothing")
+                    break
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Web research {model} failed: {type(e).__name__}: {e}")
+                    if not (reasoning and "reasoning" in str(e).lower()):
+                        break
         return ""
 
     # ------------------------------ forecasting ------------------------------
@@ -852,10 +868,12 @@ def plan_for_budget(
     mode = _env("ROSTER_MODE").lower() or "auto"
     if mode == "full":
         return Plan(3, 2, None, True, "ROSTER_MODE=full")
+    # Lean and "don't know" use the proven, cheaper previous generation: an
+    # outage of the balance API must not triple the spend per question.
     if mode == "lean":
-        return Plan(2, 1, None, False, "ROSTER_MODE=lean")
+        return Plan(2, 1, None, False, "ROSTER_MODE=lean", economy=True)
     if remaining is None:
-        return Plan(2, 1, None, False, "credit balance unknown, assuming lean")
+        return Plan(2, 1, None, False, "credit balance unknown, assuming lean", economy=True)
     # Spend per question, not per week. Running out in December would mean zero
     # coverage while questions are still resolving, which costs far more than a
     # smaller ensemble does. A question forecast with one model still scores;
@@ -869,7 +887,8 @@ def plan_for_budget(
     for main_n, mini_n, economy, cap, web, label in PLANS:
         slots = main_n * (1 - share) + mini_n * share
         key = ledger.bucket(economy, cap)
-        cost = stats.slot_cost.get(key, ledger.PRIOR_SLOT_COST.get(key, 0.0)) * slots
+        # A bucket with no measurement and no prior is treated as unaffordable.
+        cost = stats.slot_cost.get(key, ledger.PRIOR_SLOT_COST.get(key, math.inf)) * slots
         if cost <= budget * SPEND_SLACK or label == PLANS[-1][-1]:
             note = (
                 f"${remaining:.0f} left, ${budget:.3f} affordable per question at {rate:.1f}/day, "

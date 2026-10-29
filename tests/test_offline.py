@@ -34,8 +34,8 @@ import main as botmain  # noqa: E402
 import maintenance  # noqa: E402
 
 # With OpenRouter's catalog unreadable (as in these offline tests), each slot
-# resolves to its last, known-good candidate.
-GPT, CLAUDE, GEMINI = (spec.split("|")[-1] for spec, _ in botmain.DEFAULT_PRIMARY)
+# resolves to its first, preferred candidate.
+GPT, CLAUDE, GEMINI = (spec.split("|")[0] for spec, _ in botmain.DEFAULT_PRIMARY)
 PROB = {GPT: 30, CLAUDE: 50}  # each model's "opinion" on the binary question
 BROKEN: set[str] = set()      # models that should raise
 TRUNCATED: set[str] = set()   # models that stop before their final answer
@@ -84,7 +84,7 @@ async def fake_invoke(self, prompt, system_prompt=None):
 @pytest.fixture(autouse=True)
 def offline_catalog(monkeypatch):
     monkeypatch.setattr(maintenance, "fetch_available_models", lambda: None)
-    monkeypatch.setattr(botmain, "_catalog_read", False)
+    monkeypatch.setattr(botmain, "_catalog_read_at", None)
     monkeypatch.setattr(botmain, "_catalog_cache", None)
 
 
@@ -154,7 +154,7 @@ def test_third_vendor_then_backups_when_primaries_down():
     BROKEN.add(GEMINI)
     CALLS.clear()
     report = run(botmain.make_bot(2, publish=False).forecast_question(binary_q()))
-    assert "openrouter/openai/gpt-5.5" in CALLS and 0 < report.prediction < 1
+    assert botmain.DEFAULT_BACKUPS[0][0] in CALLS and 0 < report.prediction < 1
 
 
 def test_binary_parsed_locally_without_parser_calls():
@@ -708,6 +708,7 @@ def test_ledger_round_trip_prune_and_corruption(tmp_path):
         "seen": {"a": "x", "b": {"tournament": "main"}, "c": {"tournament": "main", "first_seen": NOW.isoformat()}},
         "spend": [{"ts": "bad"}, 5, {"ts": NOW.isoformat(), "effort": "uncapped", "slots": 1, "questions": 1, "usd": 0.1}],
         "created": "nonsense",
+        "version": ledger.SCHEMA_VERSION,
     }))
     damaged = ledger.Ledger.load(path)
     assert list(damaged.seen) == ["c"] and len(damaged.spend) == 1
@@ -833,7 +834,7 @@ def test_newest_listed_candidate_wins(monkeypatch):
                         lambda: {"openai/gpt-6-sol", "openai/gpt-5.6-sol", "anthropic/claude-opus-5.5"})
     assert botmain.resolve_model(botmain.DEFAULT_PRIMARY[0][0]) == "openrouter/openai/gpt-6-sol"
     assert botmain.resolve_model(botmain.DEFAULT_PRIMARY[1][0]) == "openrouter/anthropic/claude-opus-5.5"
-    # nothing listed: fall back to the known-good last candidate
+    # nothing listed: the preferred candidate, and the call-time chain covers it
     assert botmain.resolve_model(botmain.DEFAULT_PRIMARY[2][0]) == GEMINI
     assert botmain.resolve_model("openrouter/x/y") == "openrouter/x/y"
 
@@ -884,3 +885,58 @@ def test_far_out_tails_are_pulled_in_not_discarded():
     dist = NumericDistribution.from_question(fitted, q)
     assert len(dist.get_cdf()) > 100
     assert fitted[:6] == pts[:6]  # in-range values untouched
+
+
+# ---------------- regressions from the second review ----------------
+def test_lean_and_unknown_balance_use_the_cheaper_roster(monkeypatch):
+    assert botmain.plan_for_budget(None, OCT).economy
+    monkeypatch.setenv("ROSTER_MODE", "lean")
+    assert botmain.plan_for_budget(500, OCT).economy
+    monkeypatch.setenv("ROSTER_MODE", "full")
+    assert not botmain.plan_for_budget(500, OCT).economy
+
+
+def test_a_failed_catalog_read_is_retried_later(monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(botmain.time, "monotonic", lambda: clock["t"])
+    answers = iter([None, {"openai/gpt-6-sol"}])
+    reads = []
+    monkeypatch.setattr(maintenance, "fetch_available_models", lambda: reads.append(1) or next(answers))
+    spec = botmain.DEFAULT_PRIMARY[0][0]
+    assert botmain.resolve_model(spec) == GPT  # unreadable: preferred candidate
+    assert botmain.resolve_model(spec) == GPT and len(reads) == 1  # not hammered
+    clock["t"] += botmain.CATALOG_RETRY_SECONDS
+    assert botmain.resolve_model(spec) == "openrouter/openai/gpt-6-sol" and len(reads) == 2
+
+
+def test_unknown_cost_bucket_is_never_free(monkeypatch):
+    monkeypatch.setattr(botmain, "PLANS", [(1, 1, False, "medium", False, "mystery tier"), *botmain.PLANS[-1:]])
+    plan = botmain.plan_for_budget(5000, OCT, ledger.Stats(8.0, 0.25, {}, False))
+    assert plan.why.endswith("minimum viable coverage")
+
+
+def test_spend_from_another_schema_version_is_discarded(tmp_path):
+    path = tmp_path / "l.json"
+    path.write_text(json.dumps({
+        "seen": {"q": {"tournament": "main", "first_seen": NOW.isoformat()}},
+        "spend": [{"ts": NOW.isoformat(), "effort": "uncapped", "slots": 1, "questions": 1, "usd": 0.1}],
+    }))
+    book = ledger.Ledger.load(path)
+    assert book.spend == [] and list(book.seen) == ["q"]
+
+
+def test_research_retries_without_reasoning_if_rejected(monkeypatch):
+    attempts = []
+    orig = GeneralLlm.invoke
+
+    async def picky(self, prompt, system_prompt=None, **kwargs):
+        if ":online" in self.model:
+            attempts.append("reasoning" in self.litellm_kwargs)
+            if "reasoning" in self.litellm_kwargs:
+                raise RuntimeError("unsupported parameter: reasoning")
+            return "news"
+        return await orig(self, prompt, system_prompt, **kwargs)
+
+    monkeypatch.setattr(GeneralLlm, "invoke", picky)
+    text = run(botmain.make_bot(1, publish=False)._web_research(binary_q()))
+    assert text == "news" and attempts == [True, False]
