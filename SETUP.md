@@ -21,7 +21,7 @@ In the form, mention you're entering the Fall 2026 seasonal tournament and MiniB
 
 ## 3. AskNews research (optional, 10 minutes)
 
-AskNews gives bot accounts a free news allocation. The bot works without it (it falls back to a search model paid from your credits), but AskNews is what Metaculus's own best bots use.
+AskNews gives bot accounts a free news allocation. The bot works without it, but then every question's research is a web search paid from your credits (a noticeable share of the roughly $0.10 per question measured in October 2026), and the credits are what limit how many models forecast each question. AskNews is also what Metaculus's own best bots use. If you skipped this step, it is worth coming back to.
 
 Create an account at [asknews.app](https://asknews.app), then request the free bot allocation using the instructions on the Metaculus [bot resources page](https://www.metaculus.com/notebooks/38928/futureeval-resources-page/). Their process asks for your bot name, the email you registered with AskNews, your name, and a social profile link. You'll end up with either a client ID and secret, or a single API key.
 

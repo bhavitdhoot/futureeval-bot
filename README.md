@@ -12,7 +12,7 @@ The bot is built on the official [Metaculus template bot](https://github.com/Met
 
 **Research.** The bot sends the question to AskNews news search, and in parallel asks a web-search model for recent developments, the status quo, scheduled events, base rates and any market or expert forecasts. News alone misses base rates and official data, so the two are combined. When credits are tight, web search runs only if AskNews finds nothing. If both fail, the bot forecasts without research rather than skipping the question.
 
-**Prompts** (`prompts.py`). These are rewritten from the template's. Each prompt states when the question closes and resolves and how many days away that is (the template asked models to estimate "time left" without giving them the date). The model works through resolution mechanics, time left, the status quo, a reference-class base rate, the evidence, and scenarios on both sides. Calibration guidance cuts both ways: weight the status quo, but don't hedge on outcomes that are effectively decided. Numeric and date prompts remind the model that one outcome in five should land outside its 10th–90th percentile range.
+**Prompts** (`prompts.py`). These are rewritten from the template's. Each prompt states when the question closes and resolves and how many days away that is (the template asked models to estimate "time left" without giving them the date). The model works through resolution mechanics, time left, the status quo, a reference-class base rate, the evidence, and scenarios on both sides. Calibration guidance cuts both ways: weight the status quo, but don't hedge on outcomes that are effectively decided. Where a liquid prediction market or bookmaker prices the event, that price is the anchor, and the research step looks for one. Numeric and date prompts ask for the 5th to 95th percentiles and remind the model that one outcome in five should land outside its 10th–90th range.
 
 **Forecasting** uses a two-vendor roster: `openai/gpt-5.6-sol` and `anthropic/claude-opus-4.8`, both at high reasoning effort, routed through OpenRouter. How many forecasts each question gets depends on the credit balance (see "Rough credit use" below). Model choice and reasoning effort were the features most associated with rank in Metaculus's own Spring 2026 analysis: the template prompt with a frontier high-reasoning model placed 18th of 173, while the same prompt at standard effort scored less than half as well.
 
@@ -22,7 +22,7 @@ The bot is built on the official [Metaculus template bot](https://github.com/Met
 
 Reliability is treated as part of accuracy, because a skipped question scores zero:
 
-- Every model call has a fallback chain. If a model errors, or returns an empty or truncated answer with no final forecast, the call goes to the other vendor's model, then to backup models (`gpt-5.5`, `claude-opus-4.7`, `gpt-5.6-luna`).
+- Every model call has a fallback chain. If a model errors or returns nothing, the call goes to the other vendor's model, then to backup models (`gpt-5.5`, `claude-opus-4.7`, `gpt-5.6-luna`). An answer with no final forecast in it gets one retry on the next model.
 - The parser has its own fallback chain.
 - A question publishes as long as at least one model succeeds.
 - A forecast run keeps polling for new questions every 5 minutes. A failed question is retried on later polls, up to 3 attempts per run, so a question that fails for a persistent reason can't drain credits.
@@ -36,6 +36,7 @@ There is no human involvement in individual forecasts. The bot is not re-run on 
 |---|---|
 | `main.py` | Entry point. Model roster, fallbacks, research, parsing, aggregation, budget plan, which tournaments to forecast on. |
 | `prompts.py` | Forecasting and research prompts. |
+| `ledger.py` | Measured cost per forecast and question rate, for the budget plan. |
 | `template_bot.py`, `bot_helpers.py` | Metaculus's template, unchanged (kept for comparison with upstream; `main.py` overrides its prompts). |
 | `maintenance.py` | Daily: finds live tournaments (writes `TARGETS.json`), checks credit balance and model availability, raises an alert if you need to act. |
 | `.github/workflows/forecast.yaml` | Runs the bot, polling for new questions. |
@@ -57,8 +58,8 @@ Everything below is optional. Set these as repository Variables (Settings, then 
 | `RESEARCH_MODELS` | `gpt-5.6-terra:online`, `gpt-5.6-sol:online` | A web-search model is retired. |
 | `EXTRA_TOURNAMENTS` | unset | Metaculus renames a tournament and the daily check emails you. Paste its ID here. |
 | `CREDIT_FLOOR_USD` | `25` | You want the low-credit warning earlier or later. |
-| `EXPECTED_QUESTIONS_PER_DAY` | `8` | The budget plan over- or under-spends because the real question rate differs. |
-| `SEASON_END_DATE` | season's usual end | A season ends on an unusual date (`YYYY-MM-DD`). |
+| `EXPECTED_QUESTIONS_PER_DAY` | measured | Rarely: overrides the question rate the bot measures itself. |
+| `SEASON_END_DATE` | Dec 31 / Apr 30 / Aug 31 | Metaculus announces when the season's last questions open (`YYYY-MM-DD`). |
 | `BINARY_EXTREMIZE` | `1` (off) | Only with evidence from resolved questions that the pooled forecasts are underconfident; `1.2` pushes them 20% further from 50% in log-odds. |
 | `MAX_ATTEMPTS_PER_QUESTION` | `3` | Rarely. |
 | `WATCH_MINUTES`, `WATCH_INTERVAL_SECONDS` | `300`, `300` | Rarely. |
@@ -67,9 +68,19 @@ The donated Metaculus OpenRouter key only works with OpenAI, Anthropic and Googl
 
 ## Rough credit use
 
-By default the bot sizes its effort to the credits left and the days left in the season, so the money lasts the whole season. Lots of credits buys three forecasts per main question and two per MiniBench question, plus web research alongside AskNews. As credits tighten, it drops to fewer forecasts, then to medium reasoning effort, and keeps MiniBench at two forecasts as long as it can, because MiniBench results decide whether Metaculus releases more credits. Below $6 it pauses rather than leave runs half finished. Each run logs its plan and the actual spend per question.
+The bot spends what the credits can sustain until the season ends, and no more. It keeps a small ledger (`ledger.py`, carried between runs in the GitHub Actions cache) of what each forecast actually cost and how often questions actually open. Every five minutes it picks the richest plan the remaining balance can pay for at that rate:
 
-In `lean` mode, expect roughly $0.50 per seasonal-tournament question and $0.25 per MiniBench question. That works out to very roughly $300 to $400 per four-month season. These figures are estimates based on another bot's measured per-model costs, so watch the balance in your first weeks. The daily health check warns you by email when the balance drops below the floor.
+| Plan | Main tournament | MiniBench | Web research beside AskNews |
+|---|---|---|---|
+| full strength | 3 forecasts | 2 | yes |
+| two models everywhere | 2 | 2 | yes |
+| MiniBench keeps the ensemble | 1 | 2 | no |
+| one high-effort forecast | 1 | 1 | no |
+| minimum viable coverage | 1 at medium effort | 1 at medium effort | no |
+
+MiniBench keeps two forecasts longest, because its results decide whether Metaculus releases more credits. Below $6 the bot pauses rather than leave runs half finished. Topping up the key moves it up the table automatically. Each forecast run logs the plan it chose and why.
+
+Measured in October 2026: the seasonal tournament opens about 8 questions a day, one at a time, and one high-effort forecast with web research costs about $0.10. At that rate $50 covers about two months with one forecast per question. If you set up AskNews (free; see SETUP.md), research stops costing credits whenever it finds news, leaving more for forecasting.
 
 ## Credits
 
