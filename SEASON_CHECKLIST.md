@@ -10,7 +10,7 @@ Seasons start in January, May and September and run about four months. Around ea
 
 **3. Renew AskNews.** Metaculus says bot accounts must renew their AskNews allocation each season, using the same process as setup. Skip this if you didn't set up AskNews.
 
-**4. Optional: refresh the models.** When OpenAI or Anthropic release a new flagship, set the repository variable `FORECAST_MODELS` to the new slugs (format in README.md), before the new season's first questions. Check the exact slugs on openrouter.ai/models. Old models keep working for a while and backups cover retirements, so this is an accuracy upgrade, not a repair. If you'd rather not, ask Claude to look up the current slugs for you.
+**4. Optional: refresh the model candidates.** The bot already switches to the newest model in each slot that OpenRouter lists, but only among the candidates named in `main.py` (`DEFAULT_PRIMARY`). When a new flagship comes out under a new name, add its slug to the front of that slot, or set the repository variable `FORECAST_MODELS` (format in README.md). Check the exact slugs on openrouter.ai/models. The forecast log's "Model slot ... ->" lines show which model each slot is actually using.
 
 ## If you win a prize
 
@@ -22,7 +22,7 @@ Before you send payment details, ask Metaculus two questions: how they can pay a
 
 GitHub emails you when a workflow fails. The error message is at the bottom of the run's log.
 
-**"OpenRouter credits are low"** (Daily maintenance): request more credits through the form. To stretch what's left, set the variable `SKIP_MINIBENCH` to `true`, and make sure `ROSTER_MODE` isn't `full`.
+**"OpenRouter credits are low"** (Daily maintenance): request more credits through the form. The bot already scales its effort down as credits shrink. To stretch them further, set the variable `SKIP_MINIBENCH` to `true`, and make sure `ROSTER_MODE` isn't `full`.
 
 **"No [season] [year] bot tournament found"** (Daily maintenance): Metaculus probably renamed the new season's tournament. Find it on metaculus.com/aib; the ID is the number in its URL or on the page. Add it as the repository variable `EXTRA_TOURNAMENTS`. This only fires from the second month of a season, because tournaments open partway through their first month.
 

@@ -23,13 +23,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
+      # The spending ledger (ledger.py): measured cost per forecast and question
+      # rate, carried from run to run so the budget plan rests on real numbers.
+      # Each run saves a new entry; restore picks the most recent one.
+      - name: Restore spending ledger
+        uses: actions/cache/restore@v4
+        with:
+          path: .ledger
+          key: ledger-${{ github.run_id }}
+          restore-keys: ledger-
       - name: Forecast (Fall tournament + MiniBench)
         run: python main.py --mode tournament
         env:
@@ -44,9 +53,22 @@ jobs:
           ROSTER_MODE: ${{ vars.ROSTER_MODE }}
           SKIP_MINIBENCH: ${{ vars.SKIP_MINIBENCH }}
           FORECAST_MODELS: ${{ vars.FORECAST_MODELS }}
+          ECONOMY_MODELS: ${{ vars.ECONOMY_MODELS }}
           BACKUP_MODELS: ${{ vars.BACKUP_MODELS }}
           PARSER_MODELS: ${{ vars.PARSER_MODELS }}
+          RESEARCH_MODELS: ${{ vars.RESEARCH_MODELS }}
+          BINARY_EXTREMIZE: ${{ vars.BINARY_EXTREMIZE }}
           EXTRA_TOURNAMENTS: ${{ vars.EXTRA_TOURNAMENTS }}
+          EXPECTED_QUESTIONS_PER_DAY: ${{ vars.EXPECTED_QUESTIONS_PER_DAY }}
+          SEASON_END_DATE: ${{ vars.SEASON_END_DATE }}
+          MAX_ATTEMPTS_PER_QUESTION: ${{ vars.MAX_ATTEMPTS_PER_QUESTION }}
           # How long one run keeps polling, and how often it looks.
           WATCH_MINUTES: ${{ vars.WATCH_MINUTES || '300' }}
           WATCH_INTERVAL_SECONDS: ${{ vars.WATCH_INTERVAL_SECONDS || '300' }}
+      - name: Save spending ledger
+        if: always()
+        continue-on-error: true  # losing the ledger only costs the measurements
+        uses: actions/cache/save@v4
+        with:
+          path: .ledger
+          key: ledger-${{ github.run_id }}

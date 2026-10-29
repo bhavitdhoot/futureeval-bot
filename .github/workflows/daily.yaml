@@ -27,8 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -43,7 +43,9 @@ jobs:
       - name: Commit TARGETS.json and heartbeat
         if: always()
         run: |
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > HEARTBEAT
+          # Date only: one heartbeat commit per day is enough to keep the
+          # schedule alive, instead of one per 4-hourly run.
+          date -u +"%Y-%m-%d" > HEARTBEAT
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add HEARTBEAT
@@ -61,3 +63,9 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           CREDIT_FLOOR_USD: ${{ vars.CREDIT_FLOOR_USD }}
+          # So the retired-model check looks at the models actually configured.
+          FORECAST_MODELS: ${{ vars.FORECAST_MODELS }}
+          ECONOMY_MODELS: ${{ vars.ECONOMY_MODELS }}
+          BACKUP_MODELS: ${{ vars.BACKUP_MODELS }}
+          PARSER_MODELS: ${{ vars.PARSER_MODELS }}
+          RESEARCH_MODELS: ${{ vars.RESEARCH_MODELS }}
