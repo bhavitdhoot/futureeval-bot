@@ -29,6 +29,7 @@ from forecasting_tools.data_models.questions import (  # noqa: E402
     NumericQuestion,
 )
 
+import ledger  # noqa: E402
 import main as botmain  # noqa: E402
 
 GPT, CLAUDE = botmain.DEFAULT_PRIMARY[0][0], botmain.DEFAULT_PRIMARY[1][0]
@@ -91,6 +92,7 @@ def patch_llm(monkeypatch):
     STYLE["numeric_commas"] = False
     botmain._attempts.clear()
     botmain._done.clear()
+    botmain._balance_mark = None
     for var in ("BINARY_EXTREMIZE", "PARSER_MODELS", "RESEARCH_MODELS", "BACKUP_MODELS"):
         monkeypatch.delenv(var, raising=False)
 
@@ -617,13 +619,15 @@ def test_model_check_honours_parser_override(monkeypatch):
 
 
 # ---------------- spending ledger and measured budget plan ----------------
-import ledger  # noqa: E402
-
 NOW = dt.datetime(2026, 10, 29, 12, tzinfo=dt.timezone.utc)
 
 
+def fresh_book(days_old=10):
+    return ledger.Ledger(created=(NOW - dt.timedelta(days=days_old)).isoformat())
+
+
 def test_ledger_measures_rate_share_and_cost():
-    book = ledger.Ledger()
+    book = fresh_book(days_old=3)
     # 3 days, 4 main questions/day plus 1 MiniBench question a day
     for d in range(3):
         for h in range(4):
@@ -631,22 +635,31 @@ def test_ledger_measures_rate_share_and_cost():
         book.record_seen(f"b{d}", "minibench", NOW - dt.timedelta(days=d, hours=1))
     book.record_seen("m00", "main", NOW)  # seen again: not double counted
     for i in range(5):
-        book.record_spend("high", 1, 1, 0.20, NOW - dt.timedelta(hours=i))
+        book.record_spend(ledger.UNCAPPED, 1, 1, 0.20, NOW - dt.timedelta(hours=i))
     stats = book.stats(NOW)
     assert stats.measured
-    assert 4.5 < stats.questions_per_day < 6.5  # 15 questions over ~2.9 days
+    assert abs(stats.questions_per_day - 15 / 3) < 1e-9
     assert abs(stats.minibench_share - 3 / 15) < 1e-9
-    assert abs(stats.slot_cost["high"] - 0.20) < 1e-9
-    # medium had no data, so it is scaled from high at the priors' ratio
-    assert abs(stats.slot_cost["medium"] - 0.20 * 0.6) < 1e-9
+    assert abs(stats.slot_cost[ledger.UNCAPPED] - 0.20) < 1e-9
+    # medium had no data, so it is scaled from uncapped at the priors' ratio
+    assert abs(stats.slot_cost[ledger.MEDIUM] - 0.20 * 0.6) < 1e-9
+
+
+def test_backlog_on_a_fresh_ledger_is_not_counted_as_arrivals():
+    book = ledger.Ledger(created=(NOW - dt.timedelta(days=2)).isoformat())
+    for i in range(30):  # already open when the ledger started
+        book.record_seen(f"old{i}", "minibench", NOW - dt.timedelta(days=2) + dt.timedelta(minutes=1))
+    for i in range(16):  # genuinely new
+        book.record_seen(f"new{i}", "main", NOW - dt.timedelta(hours=i * 3))
+    assert abs(book.stats(NOW).questions_per_day - 8) < 1e-9
 
 
 def test_ledger_uses_totals_so_balance_lag_washes_out():
     book = ledger.Ledger()
     # the balance lagged: one batch looked free, the next paid for both
     for usd in (0.0, 0.24, 0.12, 0.12):
-        book.record_spend("high", 2, 1, usd, NOW)
-    assert abs(book.stats(NOW).slot_cost["high"] - 0.06) < 1e-9
+        book.record_spend(ledger.UNCAPPED, 2, 1, usd, NOW)
+    assert abs(book.stats(NOW).slot_cost[ledger.UNCAPPED] - 0.06) < 1e-9
 
 
 def test_ledger_priors_until_enough_data():
@@ -654,7 +667,7 @@ def test_ledger_priors_until_enough_data():
     assert not stats.measured and stats.questions_per_day == ledger.PRIOR_QUESTIONS_PER_DAY
     book = ledger.Ledger()
     book.record_seen("q", "main", NOW - dt.timedelta(hours=5))  # under 2 days of history
-    book.record_spend("high", 1, 1, 9.99, NOW)  # one slot is not a measurement
+    book.record_spend(ledger.UNCAPPED, 1, 1, 9.99, NOW)  # one slot is not a measurement
     stats = book.stats(NOW)
     assert stats.questions_per_day == ledger.PRIOR_QUESTIONS_PER_DAY
     assert stats.slot_cost == ledger.PRIOR_SLOT_COST
@@ -665,28 +678,39 @@ def test_ledger_round_trip_prune_and_corruption(tmp_path):
     book = ledger.Ledger()
     book.record_seen("old", "main", NOW - dt.timedelta(days=40))
     book.record_seen("new", "main", NOW)
-    book.record_spend("high", 1, 1, 0.1, NOW)
-    book.record_spend("high", 1, 0, 0.1, NOW)  # nothing forecast: ignored
+    book.record_spend(ledger.UNCAPPED, 1, 1, 0.1, NOW)
+    book.record_spend(ledger.UNCAPPED, 1, 0, 0.1, NOW)  # nothing forecast: ignored
     book.save(path, NOW)
     again = ledger.Ledger.load(path)
-    assert list(again.seen) == ["new"] and len(again.spend) == 1
+    assert list(again.seen) == ["new"] and len(again.spend) == 1 and again.created == book.created
     path.write_text("{not json")
     assert ledger.Ledger.load(path).seen == {}  # corrupt file never stops forecasting
+    # structurally damaged entries are dropped on load, so stats() can't crash later
+    path.write_text(json.dumps({
+        "seen": {"a": "x", "b": {"tournament": "main"}, "c": {"tournament": "main", "first_seen": NOW.isoformat()}},
+        "spend": [{"ts": "bad"}, 5, {"ts": NOW.isoformat(), "effort": "uncapped", "slots": 1, "questions": 1, "usd": 0.1}],
+        "created": "nonsense",
+    }))
+    damaged = ledger.Ledger.load(path)
+    assert list(damaged.seen) == ["c"] and len(damaged.spend) == 1
+    damaged.stats(NOW)
+    path.write_text("[1, 2]")
+    assert ledger.Ledger.load(path).spend == []
 
 
 def test_plan_follows_measured_costs():
-    cheap = ledger.Stats(8.0, 0.25, {"high": 0.03, "medium": 0.02}, True)
-    pricey = ledger.Stats(8.0, 0.25, {"high": 0.40, "medium": 0.25}, True)
+    cheap = ledger.Stats(8.0, 0.25, {ledger.UNCAPPED: 0.03, ledger.MEDIUM: 0.02}, True)
+    pricey = ledger.Stats(8.0, 0.25, {ledger.UNCAPPED: 0.40, ledger.MEDIUM: 0.25}, True)
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), cheap).main == 3
     plan = botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), pricey)
     assert (plan.main, plan.mini, plan.effort_cap) == (1, 1, "medium")  # never below coverage
     # fewer questions than assumed means more per question
-    quiet = ledger.Stats(1.0, 0.25, {"high": 0.10, "medium": 0.06}, True)
+    quiet = ledger.Stats(1.0, 0.25, {ledger.UNCAPPED: 0.10, ledger.MEDIUM: 0.06}, True)
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), quiet).main >= 2
 
 
 def test_question_rate_override(monkeypatch):
-    stats = ledger.Stats(1.0, 0.25, {"high": 0.10, "medium": 0.06}, True)
+    stats = ledger.Stats(1.0, 0.25, {ledger.UNCAPPED: 0.10, ledger.MEDIUM: 0.06}, True)
     monkeypatch.setenv("EXPECTED_QUESTIONS_PER_DAY", "40")
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), stats).effort_cap == "medium"
 
@@ -728,3 +752,58 @@ def test_numeric_tails_are_used_when_given():
     from forecasting_tools import NumericDistribution
     dist = NumericDistribution.from_question(botmain.parse_numeric(text.replace(": ", ": 1")), numeric_q())
     assert len(dist.get_cdf()) > 100
+
+
+# ---------------- regressions from the code review ----------------
+def test_late_charges_are_added_to_the_batch_they_belong_to(monkeypatch):
+    balance = {"usd": 50.0}
+    monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: balance["usd"])
+    questions = iter([[binary_q_n(41)], [], []])
+    monkeypatch.setattr(botmain, "fetch_open_questions", lambda bot, t: next(questions, []))
+
+    async def forecast(self, qs, return_exceptions=True):
+        balance["usd"] -= 0.06  # posted in time
+        return [object() for _ in qs]
+
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_questions", forecast)
+    monkeypatch.setenv("SKIP_MINIBENCH", "true")
+    run(botmain.run("tournament", publish=False))
+    balance["usd"] -= 0.04  # posted after the batch's closing reading
+    run(botmain.run("tournament", publish=False))
+    assert [round(s["usd"], 3) for s in ledger.Ledger.load().spend] == [0.10]
+
+
+def test_two_validation_misses_cost_two_calls_not_the_whole_chain():
+    TRUNCATED.update({GPT, CLAUDE})
+    roster = botmain.build_roster(2)
+    validate = botmain._validator(binary_q())
+    answer = run(roster.invoke("prompt", validate=validate))
+    assert answer.startswith("Let me think")  # first answer, handed on to the parser
+    assert CALLS == [GPT, CLAUDE]
+
+
+def test_differently_worded_final_answer_is_not_rejected():
+    validate = botmain._validator(binary_q())
+    assert validate("...so my final probability (Yes) is 35%.")
+    assert not validate("Let me think step by step about the base rate and")
+    assert botmain._validator(numeric_q())("90th percentile: 120")
+
+
+def test_rotation_follows_the_question_not_the_prompt_text():
+    roster = botmain.build_roster(2)
+    first = run(roster.invoke("Today: 11:59 ...", rotation_key="forecast:7"))
+    second = run(roster.invoke("Today: 12:00 ...", rotation_key="forecast:7"))
+    assert CALLS == [GPT, CLAUDE], (first, second)
+
+
+def test_multiple_choice_names_match_exactly():
+    text = "Final:\n<10: 20%\n10: 30%\n>10: 50%"
+    mc = botmain.parse_multiple_choice(text, ["<10", "10", ">10"])
+    assert {o.option_name: round(o.probability, 3) for o in mc.predicted_options} == {"<10": 0.2, "10": 0.3, ">10": 0.5}
+    mc = botmain.parse_multiple_choice("1. **Red**: 20%\n2. Green: 30%\n- `Blue`: 50%", ["Red", "Green", "Blue"])
+    assert mc is not None
+
+
+def test_bad_extremize_setting_does_not_block_forecasts(monkeypatch):
+    monkeypatch.setenv("BINARY_EXTREMIZE", "1.2x")
+    assert abs(botmain.pool_binary([0.3, 0.3]) - 0.3) < 1e-9

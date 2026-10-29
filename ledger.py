@@ -7,14 +7,18 @@ forecasting the remaining credits can sustain until the season ends:
 
   - every open question the bot sees, with when it first saw it
     (gives the real question rate, per tournament);
-  - every batch it forecast: how many model forecasts per question, at which
-    reasoning effort, and how much the credit balance fell
+  - every batch it forecast: how many model forecasts per question, whether
+    reasoning effort was capped, and how much the credit balance fell
     (gives the real cost of one forecast "slot").
 
 It is a small JSON file. On GitHub Actions it survives between runs through
 the Actions cache (see .github/workflows/forecast.yaml); locally it just sits
 in .ledger/. Losing it is harmless: the planner falls back to priors measured
 in October 2026 production runs.
+
+Known approximation: a batch's cost is spread evenly over its forecast slots,
+although research is a fixed cost per question. Plans with more slots per
+question therefore look slightly cheaper per slot than plans with fewer.
 """
 
 from __future__ import annotations
@@ -28,14 +32,21 @@ from pathlib import Path
 
 logger = logging.getLogger("ledger")
 
+# Spend buckets. "uncapped" is whatever reasoning effort FORECAST_MODELS
+# configures (high by default); "medium" is the planner's effort cap.
+UNCAPPED, MEDIUM = "uncapped", "medium"
 # Measured in production (Oct 2026): one high-effort GPT forecast plus web
 # research and parsing cost $0.08-0.12 per question.
-PRIOR_SLOT_COST = {"high": 0.10, "medium": 0.06}
+PRIOR_SLOT_COST = {UNCAPPED: 0.10, MEDIUM: 0.06}
 PRIOR_QUESTIONS_PER_DAY = 8.0
 PRIOR_MINIBENCH_SHARE = 0.25
 KEEP_DAYS = 30
 RATE_WINDOW_DAYS = 7
-COST_WINDOW = 25  # most recent spend records used per effort level
+MIN_RATE_DAYS = 2  # measure the question rate only over at least this long
+# Questions seen within this long of a fresh ledger's start were already open:
+# they are a backlog, not arrivals, and would inflate the rate if counted.
+BASELINE = dt.timedelta(minutes=30)
+COST_WINDOW = 25  # most recent spend records used per bucket
 
 
 def ledger_path() -> Path:
@@ -51,6 +62,27 @@ def _parse(ts: str) -> dt.datetime:
     return when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
 
 
+def _valid_seen(v) -> bool:
+    try:
+        return isinstance(v, dict) and isinstance(v["tournament"], str) and bool(_parse(v["first_seen"]))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _valid_spend(s) -> bool:
+    try:
+        return (
+            isinstance(s, dict)
+            and bool(_parse(s["ts"]))
+            and isinstance(s["effort"], str)
+            and int(s["slots"]) > 0
+            and int(s["questions"]) > 0
+            and float(s["usd"]) >= 0
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @dataclass
 class Stats:
     questions_per_day: float
@@ -64,27 +96,45 @@ class Stats:
 class Ledger:
     seen: dict[str, dict] = field(default_factory=dict)  # question key -> {tournament, first_seen}
     spend: list[dict] = field(default_factory=list)  # {ts, effort, slots, questions, usd}
+    created: str = field(default_factory=lambda: _now().isoformat())
 
     # ---------------------------------------------------------------- io
     @classmethod
     def load(cls, path: Path | None = None) -> Ledger:
+        """Never raises: a missing, corrupt or half-valid file gives what can be salvaged."""
         path = path or ledger_path()
         try:
             data = json.loads(path.read_text())
-            return cls(seen=dict(data.get("seen", {})), spend=list(data.get("spend", [])))
         except FileNotFoundError:
             return cls()
         except Exception as e:  # noqa: BLE001 - a corrupt ledger must never stop forecasting
             logger.warning(f"Ignoring unreadable ledger {path}: {type(e).__name__}: {e}")
             return cls()
+        if not isinstance(data, dict):
+            return cls()
+        seen = data.get("seen") if isinstance(data.get("seen"), dict) else {}
+        spend = data.get("spend") if isinstance(data.get("spend"), list) else []
+        book = cls(
+            seen={str(k): v for k, v in seen.items() if _valid_seen(v)},
+            spend=[s for s in spend if _valid_spend(s)],
+        )
+        try:
+            book.created = _parse(data["created"]).isoformat()
+        except Exception:  # noqa: BLE001 - older or damaged file: treat as fresh
+            pass
+        dropped = len(seen) - len(book.seen) + len(spend) - len(book.spend)
+        if dropped:
+            logger.warning(f"Dropped {dropped} malformed ledger entries from {path}")
+        return book
 
     def save(self, path: Path | None = None, now: dt.datetime | None = None) -> None:
         path = path or ledger_path()
-        self.prune(now)
         try:
+            self.prune(now)
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"seen": self.seen, "spend": self.spend}, indent=1))
+            payload = {"created": self.created, "seen": self.seen, "spend": self.spend}
+            tmp.write_text(json.dumps(payload, indent=1))
             tmp.replace(path)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Could not save ledger {path}: {type(e).__name__}: {e}")
@@ -102,46 +152,66 @@ class Ledger:
     def record_spend(
         self, effort: str, slots: int, questions: int, usd: float, now: dt.datetime | None = None
     ) -> None:
-        if questions <= 0 or slots <= 0 or usd < 0:
+        if questions <= 0 or slots <= 0:
             return
         self.spend.append(
-            {"ts": (now or _now()).isoformat(), "effort": effort, "slots": slots, "questions": questions, "usd": round(usd, 5)}
+            {
+                "ts": (now or _now()).isoformat(),
+                "effort": effort,
+                "slots": slots,
+                "questions": questions,
+                "usd": round(max(usd, 0.0), 5),
+            }
         )
+
+    def add_late_charges(self, usd: float) -> None:
+        """
+        Charges that reached the balance only after a batch's closing reading
+        belong to that batch (nothing else spends from the key between
+        batches). Without this they would fall between readings and never be
+        counted, making forecasts look cheaper than they are.
+        """
+        if usd > 0 and self.spend:
+            self.spend[-1]["usd"] = round(self.spend[-1]["usd"] + usd, 5)
 
     # ---------------------------------------------------------------- stats
     def stats(self, now: dt.datetime | None = None) -> Stats:
         now = now or _now()
         notes, measured = [], False
 
-        window_start = now - dt.timedelta(days=RATE_WINDOW_DAYS)
-        recent = [v for v in self.seen.values() if _parse(v["first_seen"]) >= window_start]
-        first = min((_parse(v["first_seen"]) for v in self.seen.values()), default=None)
-        span_days = min(RATE_WINDOW_DAYS, (now - first).total_seconds() / 86400) if first else 0
-        if span_days >= 2 and recent:
-            rate = len(recent) / span_days
-            share = sum(1 for v in recent if v["tournament"] == "minibench") / len(recent)
+        created = _parse(self.created)
+        window_start = max(created, now - dt.timedelta(days=RATE_WINDOW_DAYS))
+        span_days = (now - window_start).total_seconds() / 86400
+        arrivals = [
+            v
+            for v in self.seen.values()
+            if _parse(v["first_seen"]) >= window_start and _parse(v["first_seen"]) > created + BASELINE
+        ]
+        if span_days >= MIN_RATE_DAYS and arrivals:
+            rate = len(arrivals) / span_days
+            share = sum(1 for v in arrivals if v["tournament"] == "minibench") / len(arrivals)
             notes.append(f"{rate:.1f} questions/day measured")
             measured = True
         else:
             rate, share = PRIOR_QUESTIONS_PER_DAY, PRIOR_MINIBENCH_SHARE
 
         found = {}
-        for effort in PRIOR_SLOT_COST:
-            rows = [s for s in self.spend if s["effort"] == effort][-COST_WINDOW:]
+        for bucket in PRIOR_SLOT_COST:
+            rows = [s for s in self.spend if s["effort"] == bucket][-COST_WINDOW:]
             slots = sum(s["slots"] * s["questions"] for s in rows)
-            # Totals, not a median of per-batch costs: the balance can lag a
-            # call by a few seconds, which moves cost between neighbouring
-            # batches but not out of the total.
+            # Totals, not a median of per-batch costs: a charge that posts
+            # during the next batch moves cost between neighbouring batches but
+            # not out of the total.
             if slots >= 3:
-                found[effort] = sum(s["usd"] for s in rows) / slots
-                notes.append(f"${found[effort]:.3f}/forecast at {effort} effort measured")
+                found[bucket] = sum(s["usd"] for s in rows) / slots
+                notes.append(f"${found[bucket]:.3f}/forecast {bucket} measured")
                 measured = True
-        # A level without data is scaled from one with data, at the priors' ratio.
-        ratio = PRIOR_SLOT_COST["medium"] / PRIOR_SLOT_COST["high"]
+        # A bucket without data is scaled from one with data, at the priors' ratio.
+        ratio = PRIOR_SLOT_COST[MEDIUM] / PRIOR_SLOT_COST[UNCAPPED]
         slot_cost = dict(PRIOR_SLOT_COST)
         slot_cost.update(found)
-        if "high" in found and "medium" not in found:
-            slot_cost["medium"] = found["high"] * ratio
-        if "medium" in found and "high" not in found:
-            slot_cost["high"] = found["medium"] / ratio
+        if UNCAPPED in found and MEDIUM not in found:
+            slot_cost[MEDIUM] = found[UNCAPPED] * ratio
+        if MEDIUM in found and UNCAPPED not in found:
+            slot_cost[UNCAPPED] = found[MEDIUM] / ratio
         return Stats(rate, share, slot_cost, measured, ", ".join(notes) or "priors only")

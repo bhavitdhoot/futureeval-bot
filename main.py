@@ -176,10 +176,15 @@ def _identity(llm: GeneralLlm) -> tuple[str, str]:
 class RosterLlm(GeneralLlm):
     """
     Looks like one GeneralLlm to the framework, but:
-      - rotates the first-choice model across repeated identical prompts, so
-        prediction #1 for a question goes to model A, #2 to model B, etc.;
-      - on any error, an empty answer, or an answer that fails `validate`,
-        falls through the remaining roster, then the backups.
+      - rotates the first-choice model across repeated calls with the same
+        `rotation_key` (the question; by default the prompt), so prediction #1
+        for a question goes to model A, #2 to model B, etc.;
+      - on any error or an empty answer, falls through the remaining roster,
+        then the backups;
+      - an answer that fails `validate` (no final forecast where one was
+        asked for) gets one more model's attempt. If that misses too, the
+        first answer goes on to the parser rather than paying for the whole
+        chain: the check is a heuristic, the parser is the real judge.
     The framework then aggregates the predictions, which is what gives us a
     real ensemble.
     """
@@ -209,11 +214,16 @@ class RosterLlm(GeneralLlm):
         prompt,
         system_prompt: str | None = None,
         validate: Callable[[str], bool] | None = None,
+        rotation_key: str | None = None,
     ) -> str:
-        key = hashlib.sha256(repr((prompt, system_prompt)).encode()).hexdigest()
+        # Keyed on the question when the caller says which: prompts carry the
+        # current time, so two predictions built either side of a minute
+        # boundary would otherwise both start with model A.
+        key = rotation_key or hashlib.sha256(repr((prompt, system_prompt)).encode()).hexdigest()
         k = self._calls[key]
         self._calls[key] += 1  # incremented before any await: safe under asyncio
-        errors = []
+        errors: list[str] = []
+        unvalidated: tuple[str, str] | None = None  # (model, answer) of the first miss
         for i, llm in enumerate(self.chain(k)):
             try:
                 if system_prompt is None:
@@ -222,16 +232,23 @@ class RosterLlm(GeneralLlm):
                     answer = await llm.invoke(prompt, system_prompt=system_prompt)
                 if not isinstance(answer, str) or not answer.strip():
                     raise ValueError("empty answer")
-                if validate is not None and not validate(answer):
-                    raise ValueError(f"answer has no final forecast (ends: {answer[-200:]!r})")
-                if i > 0:
-                    logger.warning(
-                        f"Fallback used: {llm.model} answered after {i} failure(s): {errors}"
-                    )
-                self.usage_log.append(llm.model)
-                return answer
             except Exception as e:  # noqa: BLE001 - any failure means try the next model
                 errors.append(f"{llm.model}: {type(e).__name__}: {str(e)[:300]}")
+                continue
+            if validate is not None and not validate(answer):
+                errors.append(f"{llm.model}: no final forecast (ends: {answer[-150:]!r})")
+                if unvalidated is None:
+                    unvalidated = (llm.model, answer)
+                    continue
+                break  # second miss: stop paying, let the parser try the first
+            if i > 0:
+                logger.warning(f"Fallback used: {llm.model} answered after {i} failure(s): {errors}")
+            self.usage_log.append(llm.model)
+            return answer
+        if unvalidated is not None:
+            logger.warning(f"Using {unvalidated[0]}'s answer unvalidated after: {errors}")
+            self.usage_log.append(unvalidated[0])
+            return unvalidated[1]
         raise RuntimeError("Every model in the chain failed: " + " | ".join(errors))
 
 
@@ -289,20 +306,32 @@ def parse_binary(text: str) -> float | None:
     return value if 0 <= value <= 1 else None
 
 
+_OPTION_LINE = re.compile(
+    rf"^\s*(?:[-*•]\s+|\d+[.)]\s+)?[*_`\"']*(.+?)[*_`\"']*\s*[:=]\s*\**\s*({_NUM})\s*%",
+    re.M,
+)
+
+
+def _option_name(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
 def parse_multiple_choice(text: str, options: list[str]) -> PredictedOptionList | None:
     """
     One "Option: XX%" line per option, using the exact option names, or None.
-    `\\W*:` after the name stops option "1" matching a line for option "10".
+    Names must match exactly (ignoring case, spacing and markdown), so option
+    "10" never picks up the line for ">10" or "10+".
     """
+    wanted = {_option_name(o): o for o in options}
+    if len(wanted) != len(options):
+        return None  # options that differ only by case or spacing: leave it to the parser
     probs = {}
-    for option in options:
-        pattern = re.compile(
-            rf"^[\W_]*{re.escape(option)}[\W_]*?\s*[:=]\s*\**\s*({_NUM})\s*%", re.I | re.M
-        )
-        found = pattern.findall(text)
-        if not found:
-            return None
-        probs[option] = float(found[-1])
+    for name, value in _OPTION_LINE.findall(text):
+        option = wanted.get(_option_name(name))
+        if option is not None:
+            probs[option] = float(value)  # later lines win: the final answer comes last
+    if len(probs) != len(options):
+        return None
     total = sum(probs.values())
     if not 95 <= total <= 105:
         return None
@@ -372,7 +401,12 @@ def pool_binary(predictions: list[float]) -> float:
     pool toward the tail instead of splitting the difference in probability
     space, which is what log scoring rewards when the confidence is earned.
     """
-    factor = float(_env("BINARY_EXTREMIZE") or 1.0)
+    try:
+        factor = float(_env("BINARY_EXTREMIZE") or 1.0)
+    except ValueError:
+        # A typo in a repo variable must not block every paid-for binary forecast.
+        logger.warning(f"Ignoring unparsable BINARY_EXTREMIZE={_env('BINARY_EXTREMIZE')!r}")
+        factor = 1.0
     clipped = [min(max(p, 0.001), 0.999) for p in predictions]
     mean_logit = sum(math.log(p / (1 - p)) for p in clipped) / len(clipped)
     pooled = 1 / (1 + math.exp(-mean_logit * factor))
@@ -387,9 +421,9 @@ def _validator(question: MetaculusQuestion) -> Callable[[str], bool]:
     it only looks at the end, where the final answer was asked to be.
     """
     if isinstance(question, BinaryQuestion):
-        return lambda text: bool(re.search(rf"Probability\s*\**\s*[:=]?\s*\**\s*{_NUM}", text[-1500:], re.I))
+        return lambda text: bool(re.search(rf"{_NUM}\s*%", text[-1500:]))
     if isinstance(question, (NumericQuestion, DateQuestion)):
-        return lambda text: bool(re.search(r"Percentile\s*90", text[-1500:], re.I))
+        return lambda text: bool(re.search(r"percentile|\b9[05](?:th)?\b", text[-1500:], re.I))
     return lambda text: bool(re.search(rf"{_NUM}\s*%", text[-3000:]))
 
 
@@ -399,6 +433,7 @@ def _validator(question: MetaculusQuestion) -> Callable[[str], bool]:
 class FutureEvalBot(SummerTemplateBot2026):
     _max_concurrent_questions = 2
     _concurrency_limiter = asyncio.Semaphore(2)  # replaced per event loop in run()
+    _web_limiter = asyncio.Semaphore(4)  # likewise
 
     # Set by make_bot. Kept off __init__ because the framework builds each
     # forecast's published config from the __init__ signature.
@@ -438,6 +473,12 @@ class FutureEvalBot(SummerTemplateBot2026):
         return text
 
     async def _web_research(self, question: MetaculusQuestion) -> str:
+        # A MiniBench batch opens many questions at once; searching for all of
+        # them in parallel invites rate limits, which would empty the research.
+        async with self._web_limiter:
+            return await self._web_research_unthrottled(question)
+
+    async def _web_research_unthrottled(self, question: MetaculusQuestion) -> str:
         prompt = prompts.web_research_prompt(question)
         for model in research_models():
             try:
@@ -452,7 +493,9 @@ class FutureEvalBot(SummerTemplateBot2026):
 
     # ------------------------------ forecasting ------------------------------
     async def _reason(self, question: MetaculusQuestion, prompt: str) -> str:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt, validate=_validator(question))
+        reasoning = await self.get_llm("default", "llm").invoke(
+            prompt, validate=_validator(question), rotation_key=f"forecast:{question_key(question)}"
+        )
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         return reasoning
 
@@ -667,8 +710,8 @@ class Plan:
 
     @property
     def effort_label(self) -> str:
-        """How the ledger files this plan's spend."""
-        return self.effort_cap or "high"
+        """The ledger bucket this plan's spend is filed under."""
+        return self.effort_cap or ledger.UNCAPPED
 
 
 # Richest first. The planner takes the first one the credits can sustain until
@@ -718,7 +761,7 @@ def plan_for_budget(
     share = stats.minibench_share
     for main_n, mini_n, cap, web, label in PLANS:
         slots = main_n * (1 - share) + mini_n * share
-        cost = stats.slot_cost[cap or "high"] * slots
+        cost = stats.slot_cost[cap or ledger.UNCAPPED] * slots
         if cost <= budget * SPEND_SLACK or label == PLANS[-1][-1]:
             note = (
                 f"${remaining:.0f} left, ${budget:.3f} affordable per question at {rate:.1f}/day, "
@@ -737,6 +780,9 @@ def plan_for_budget(
 # forecast on Metaculus) would be re-forecast every cycle, paying each time.
 _attempts: Counter[str] = Counter()
 _done: set[str] = set()
+# The balance after the last forecast batch. Charges can post a few seconds
+# late; whatever left the balance since then belongs to that batch.
+_balance_mark: float | None = None
 
 
 def max_attempts() -> int:
@@ -775,12 +821,17 @@ def select_questions(
 async def run(mode: str, publish: bool) -> int:
     # Fresh semaphore bound to this event loop.
     FutureEvalBot._concurrency_limiter = asyncio.Semaphore(FutureEvalBot._max_concurrent_questions)
+    FutureEvalBot._web_limiter = asyncio.Semaphore(4)
 
     # Practice runs on the testing area would distort the measured question
     # rate and costs, so only tournament runs feed the ledger.
     live = mode != "test_questions"
+    global _balance_mark
     book = ledger.Ledger.load()
     remaining = maintenance.fetch_credits_remaining()
+    if live and _balance_mark is not None and remaining is not None:
+        book.add_late_charges(_balance_mark - remaining)
+        _balance_mark = None
     plan = plan_for_budget(remaining, dt.date.today(), book.stats())
     logger.info(
         f"Budget plan: {plan.main} forecast(s) per tournament question, {plan.mini} per MiniBench "
@@ -825,7 +876,9 @@ async def run(mode: str, publish: bool) -> int:
             continue
         for q in questions:
             _attempts[question_key(q)] += 1
-        before = maintenance.fetch_credits_remaining() if live else None
+        # Chain readings: a batch starts from the previous batch's closing
+        # balance, so a late charge lands in the next batch, not in a gap.
+        before = (_balance_mark if _balance_mark is not None else maintenance.fetch_credits_remaining()) if live else None
         # select_questions already applied the framework's skip filter, so
         # reports line up one-to-one with questions.
         reports = await bot.forecast_questions(questions, return_exceptions=True)
@@ -833,6 +886,7 @@ async def run(mode: str, publish: bool) -> int:
         if before is not None and after is not None:
             slots = plan.mini if bot is mini_bot else plan.main
             book.record_spend(plan.effort_label, slots, len(questions), before - after)
+            _balance_mark = after
         for q, r in zip(questions, reports):
             if isinstance(r, BaseException):
                 failures += 1
