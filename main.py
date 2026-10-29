@@ -75,6 +75,7 @@ from forecasting_tools import (  # noqa: E402
 )
 from forecasting_tools.data_models.questions import MetaculusQuestion  # noqa: E402
 
+import ledger  # noqa: E402
 import maintenance  # noqa: E402
 import prompts  # noqa: E402
 from template_bot import SummerTemplateBot2026  # noqa: E402
@@ -275,7 +276,8 @@ _PERCENTILE_DATE = re.compile(
     r"(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?)\s*\**\s*(?:\([^)]*\))?[\s\"']*$",
     re.I | re.M,
 )
-EXPECTED_PERCENTILES = (10, 20, 40, 60, 80, 90)
+REQUIRED_PERCENTILES = (10, 20, 40, 60, 80, 90)
+TAIL_PERCENTILES = (5, 95)  # asked for, but an answer without them still parses
 
 
 def parse_binary(text: str) -> float | None:
@@ -318,19 +320,27 @@ def _last_by_percentile(matches) -> dict[int, str]:
     return out
 
 
+def _wanted(found: dict[int, str]) -> list[int] | None:
+    if not all(p in found for p in REQUIRED_PERCENTILES):
+        return None
+    return sorted({*REQUIRED_PERCENTILES, *(p for p in TAIL_PERCENTILES if p in found)})
+
+
 def parse_numeric(text: str) -> list[Percentile] | None:
     found = _last_by_percentile(_PERCENTILE_NUMBER.findall(text))
-    if not all(p in found for p in EXPECTED_PERCENTILES):
+    wanted = _wanted(found)
+    if wanted is None:
         return None
-    return [Percentile(percentile=p / 100, value=float(found[p])) for p in EXPECTED_PERCENTILES]
+    return [Percentile(percentile=p / 100, value=float(found[p])) for p in wanted]
 
 
 def parse_date(text: str) -> list[Percentile] | None:
     found = _last_by_percentile(_PERCENTILE_DATE.findall(text))
-    if not all(p in found for p in EXPECTED_PERCENTILES):
+    wanted = _wanted(found)
+    if wanted is None:
         return None
     out = []
-    for p in EXPECTED_PERCENTILES:
+    for p in wanted:
         try:
             when = dt.datetime.fromisoformat(found[p].replace(" ", "T"))
         except ValueError:
@@ -615,7 +625,13 @@ def main_tournaments(today: dt.date) -> list[int | str]:
 # Spending plan
 # --------------------------------------------------------------------------
 def season_end(today: dt.date) -> dt.date:
-    """Roughly when the current season stops opening questions."""
+    """
+    Roughly when the current season stops opening questions. Metaculus stops
+    "a few weeks before" the next season starts (Summer 2026 announcement), so
+    the season boundary is a safe upper estimate: assuming too late wastes a
+    little accuracy, assuming too early runs the credits dry while questions
+    are still opening.
+    """
     override = _env("SEASON_END_DATE")
     if override:
         try:
@@ -624,16 +640,21 @@ def season_end(today: dt.date) -> dt.date:
             logger.warning(f"Ignoring unparsable SEASON_END_DATE={override!r}")
     season = maintenance.season_of(today)
     if season == "fall":
-        return dt.date(today.year + 1, 1, 6)
+        return dt.date(today.year, 12, 31)
     if season == "spring":
-        return dt.date(today.year, 5, 6)
-    return dt.date(today.year, 9, 1)
+        return dt.date(today.year, 4, 30)
+    return dt.date(today.year, 8, 31)
 
 
-def affordable_per_question(remaining: float, today: dt.date) -> float:
-    days_left = max((season_end(today) - today).days, 1)
-    per_day = float(_env("EXPECTED_QUESTIONS_PER_DAY") or 8)
-    return remaining / max(days_left * per_day, 1)
+# Never plan as if fewer days remain than this. Near the estimated season end
+# the per-question budget would otherwise balloon and spend everything on the
+# last few questions, leaving nothing if questions keep opening a while longer.
+MIN_DAYS_LEFT = 7
+
+
+def affordable_per_question(remaining: float, today: dt.date, questions_per_day: float) -> float:
+    days_left = max((season_end(today) - today).days, MIN_DAYS_LEFT)
+    return remaining / max(days_left * questions_per_day, 1)
 
 
 @dataclass(frozen=True)
@@ -644,20 +665,39 @@ class Plan:
     web_research: bool  # run web search alongside AskNews
     why: str
 
+    @property
+    def effort_label(self) -> str:
+        """How the ledger files this plan's spend."""
+        return self.effort_cap or "high"
 
-def plan_for_budget(remaining: float | None, today: dt.date | None = None) -> Plan:
+
+# Richest first. The planner takes the first one the credits can sustain until
+# the season ends. MiniBench keeps two forecasts longest: it is the tournament
+# Metaculus watches when deciding whether to release more credits.
+PLANS = [
+    (3, 2, None, True, "full strength"),
+    (2, 2, None, True, "two models everywhere"),
+    (1, 2, None, False, "MiniBench keeps the ensemble"),
+    (1, 1, None, False, "one high-effort forecast"),
+    (1, 1, "medium", False, "minimum viable coverage"),
+]
+# The plan is re-chosen every five minutes from the live balance, so running
+# slightly hot corrects itself; this stops it flapping between two plans.
+SPEND_SLACK = 1.1
+
+
+def plan_for_budget(
+    remaining: float | None, today: dt.date | None = None, stats: ledger.Stats | None = None
+) -> Plan:
     """
-    Decide how much effort each question gets, from the credits left.
+    Decide how much forecasting each question gets, from the credits left, the
+    days left in the season, and what forecasts have actually cost.
 
-    Metaculus releases credits incrementally: an initial grant, then more if
-    MiniBench performance is above average (plus a bonus for open-source bots).
-    So when credits are tight, MiniBench keeps the two-model ensemble, because
-    that is the tournament that unlocks the rest of the funding, while
-    tournament questions drop to one forecast so coverage never hits zero.
-
-    Savings come from fewer forecasts and lower reasoning effort, never from a
-    lower max_tokens: a capped reasoning model can run out of tokens before
-    writing its answer, which wastes the whole call.
+    Costs and the question rate come from the ledger (measured), or from
+    priors taken from production runs until enough has been measured. Savings
+    come from fewer forecasts and lower reasoning effort, never from a lower
+    max_tokens: a capped reasoning model can run out of tokens before writing
+    its answer, which wastes the whole call.
     """
     mode = _env("ROSTER_MODE").lower() or "auto"
     if mode == "full":
@@ -672,15 +712,20 @@ def plan_for_budget(remaining: float | None, today: dt.date | None = None) -> Pl
     # a question never forecast scores nothing.
     if remaining < 6:
         return Plan(0, 0, None, False, f"${remaining:.2f} left, paused to avoid half-finished runs")
-    budget = affordable_per_question(remaining, today or dt.date.today())
-    note = f"${remaining:.0f} left, ${budget:.3f} affordable per question"
-    if budget >= 0.40:
-        return Plan(3, 2, None, True, note + ", full strength")
-    if budget >= 0.22:
-        return Plan(2, 2, None, True, note + ", two models everywhere")
-    if budget >= 0.10:
-        return Plan(1, 2, "medium", False, note + ", MiniBench keeps the ensemble")
-    return Plan(1, 1, "medium", False, note + ", minimum viable coverage")
+    stats = stats or ledger.Ledger().stats()
+    rate = float(_env("EXPECTED_QUESTIONS_PER_DAY") or 0) or stats.questions_per_day
+    budget = affordable_per_question(remaining, today or dt.date.today(), rate)
+    share = stats.minibench_share
+    for main_n, mini_n, cap, web, label in PLANS:
+        slots = main_n * (1 - share) + mini_n * share
+        cost = stats.slot_cost[cap or "high"] * slots
+        if cost <= budget * SPEND_SLACK or label == PLANS[-1][-1]:
+            note = (
+                f"${remaining:.0f} left, ${budget:.3f} affordable per question at {rate:.1f}/day, "
+                f"this plan ~${cost:.3f} ({stats.why}), {label}"
+            )
+            return Plan(main_n, mini_n, cap, web, note)
+    raise AssertionError("unreachable: the last plan is always accepted")
 
 
 # --------------------------------------------------------------------------
@@ -731,8 +776,12 @@ async def run(mode: str, publish: bool) -> int:
     # Fresh semaphore bound to this event loop.
     FutureEvalBot._concurrency_limiter = asyncio.Semaphore(FutureEvalBot._max_concurrent_questions)
 
+    # Practice runs on the testing area would distort the measured question
+    # rate and costs, so only tournament runs feed the ledger.
+    live = mode != "test_questions"
+    book = ledger.Ledger.load()
     remaining = maintenance.fetch_credits_remaining()
-    plan = plan_for_budget(remaining, dt.date.today())
+    plan = plan_for_budget(remaining, dt.date.today(), book.stats())
     logger.info(
         f"Budget plan: {plan.main} forecast(s) per tournament question, {plan.mini} per MiniBench "
         f"question, effort cap {plan.effort_cap or 'none'}, web research "
@@ -761,17 +810,29 @@ async def run(mode: str, publish: bool) -> int:
     successes, failures, seen = 0, 0, set()
     for bot, tournament in jobs:
         try:
-            questions = select_questions(bot, fetch_open_questions(bot, tournament), seen)
+            open_questions = fetch_open_questions(bot, tournament)
         except Exception as e:  # noqa: BLE001 - e.g. a guessed slug that doesn't exist
             logger.info(f"Skipping tournament {tournament!r}: {type(e).__name__}: {str(e)[:200]}")
             continue
+        if live:
+            # Count each question under the first tournament it was seen in,
+            # so one reachable through two IDs isn't counted twice.
+            for q in open_questions:
+                if question_key(q) not in seen:
+                    book.record_seen(question_key(q), "minibench" if tournament == MINIBENCH else "main")
+        questions = select_questions(bot, open_questions, seen)
         if not questions:
             continue
         for q in questions:
             _attempts[question_key(q)] += 1
+        before = maintenance.fetch_credits_remaining() if live else None
         # select_questions already applied the framework's skip filter, so
         # reports line up one-to-one with questions.
         reports = await bot.forecast_questions(questions, return_exceptions=True)
+        after = maintenance.fetch_credits_remaining() if live else None
+        if before is not None and after is not None:
+            slots = plan.mini if bot is mini_bot else plan.main
+            book.record_spend(plan.effort_label, slots, len(questions), before - after)
         for q, r in zip(questions, reports):
             if isinstance(r, BaseException):
                 failures += 1
@@ -790,6 +851,9 @@ async def run(mode: str, publish: bool) -> int:
             spent = remaining - left
             per_q = f"${spent / successes:.3f}" if successes else "n/a"
             logger.info(f"Credits: ${left:.2f} left, ${spent:.2f} spent this run, {per_q} per question")
+
+    if live:
+        book.save()
 
     # Fail the workflow (which makes GitHub email you) only for systematic
     # breakage: something failed and nothing succeeded. Isolated failures are

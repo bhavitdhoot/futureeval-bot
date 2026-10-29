@@ -14,9 +14,14 @@ untouched, for diffing against upstream). What changed, and why:
 - Calibration guidance that cuts both ways: the template's "extra weight on the
   status quo" alone pushes models to hedge, while log scoring punishes both
   hedging on near-certain outcomes and overconfidence.
-- Numeric/date questions remind the model that 1 in 5 outcomes lands outside
-  its 10th-90th percentile range (LLM intervals are typically too narrow), and
-  ask for plain numbers, which lets the bot parse most answers locally.
+- Numeric/date questions ask for 5th and 95th percentiles too (the template
+  stopped at 10/90 and left the tails to interpolation), remind the model that
+  1 in 5 outcomes lands outside its 10th-90th range (LLM intervals are
+  typically too narrow), and ask for plain numbers, which lets the bot parse
+  most answers locally.
+- Market prices, where they exist, are named as the strongest anchor, and the
+  research prompt goes looking for them (production research was already
+  finding bookmaker odds, with nothing telling the model how to weigh them).
 - Research prompts carry today's date, so "latest news" means something to a
   search model, and ask for base rates and scheduled events, not just headlines.
 """
@@ -105,7 +110,8 @@ _CALIBRATION = clean_indents(
     Calibration reminders:
     - The world usually changes slowly, and question writers tend to ask about changes that sound plausible but mostly don't happen in short windows. Weigh the status quo heavily when little time is left.
     - But don't hedge out of uncertainty you don't have. If the outcome is effectively decided, say so with an extreme probability.
-    - Strong, specific, recent evidence beats a base rate; vague commentary does not."""
+    - Strong, specific, recent evidence beats a base rate; vague commentary does not.
+    - If a liquid prediction market (Polymarket, Kalshi) or bookmaker prices the same event, that price is the strongest single anchor available: start from it, after removing the bookmaker's margin, and move away only for a specific reason. Thin markets (e.g. Manifold) and pundit predictions are weaker evidence."""
 )
 
 
@@ -162,9 +168,9 @@ def multiple_choice_prompt(question, research: str, conditional_note: str = "") 
 _PERCENTILE_GUIDE = clean_indents(
     """
     Distribution reminders:
-    - Percentiles 10 and 90 are not extremes: one outcome in five should land outside them. Forecasters' intervals are usually too narrow, so widen yours for unknown unknowns, especially when the resolution is far away.
+    - Percentiles 10 and 90 are not extremes: one outcome in five should land outside them, and one in ten outside percentiles 5 and 95. Forecasters' intervals are usually too narrow, so widen yours for unknown unknowns, especially when the resolution is far away.
     - The distribution need not be symmetric. Put the long tail on the side where surprises are more likely.
-    - Values must increase from percentile 10 to percentile 90.
+    - Values must increase from percentile 5 to percentile 95.
     """
 )
 
@@ -194,13 +200,15 @@ def numeric_prompt(
         {conditional_note}
 
         Give values in the question's units as plain numbers: no thousands separators, no scientific notation, no words like "million".
-        End your answer with exactly these six lines:
+        End your answer with exactly these eight lines:
+        Percentile 5: XX
         Percentile 10: XX
         Percentile 20: XX
         Percentile 40: XX
         Percentile 60: XX
         Percentile 80: XX
         Percentile 90: XX
+        Percentile 95: XX
         """
     )
 
@@ -228,13 +236,15 @@ def date_prompt(
         {conditional_note}
 
         Write dates as YYYY-MM-DD (append THH:MM:SSZ in UTC only if the hour matters), earliest first.
-        End your answer with exactly these six lines:
+        End your answer with exactly these eight lines:
+        Percentile 5: YYYY-MM-DD
         Percentile 10: YYYY-MM-DD
         Percentile 20: YYYY-MM-DD
         Percentile 40: YYYY-MM-DD
         Percentile 60: YYYY-MM-DD
         Percentile 80: YYYY-MM-DD
         Percentile 90: YYYY-MM-DD
+        Percentile 95: YYYY-MM-DD
         """
     )
 
@@ -250,7 +260,8 @@ def web_research_prompt(question: MetaculusQuestion) -> str:
         - the current status quo, and how the question would resolve if it resolved today;
         - scheduled events before the resolution date that could decide it;
         - base rates: how often comparable events have happened, and relevant historical or trend data;
-        - forecasts from prediction markets, experts or official projections, if any.
+        - prices on prediction markets (Polymarket, Kalshi, Manifold) and bookmakers for this event or closely related ones, with the exact contract, price and date; convert betting odds to implied probabilities;
+        - forecasts from experts or official projections, if any.
 
         Question:
         {question.question_text}

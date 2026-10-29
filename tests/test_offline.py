@@ -78,6 +78,12 @@ async def fake_invoke(self, prompt, system_prompt=None):
 
 
 @pytest.fixture(autouse=True)
+def isolated_ledger(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEDGER_PATH", str(tmp_path / "ledger.json"))
+    monkeypatch.delenv("EXPECTED_QUESTIONS_PER_DAY", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def patch_llm(monkeypatch):
     CALLS.clear()
     BROKEN.clear()
@@ -278,8 +284,8 @@ def test_main_uses_fresh_targets_file(tmp_path, monkeypatch):
 
 
 # ---------------- budget planning ----------------
-OCT = dt.date(2026, 10, 11)   # 87 days of season left
-DEC = dt.date(2026, 12, 20)   # 17 days left
+OCT = dt.date(2026, 10, 11)   # 81 days of season left
+DEC = dt.date(2026, 12, 15)   # 16 days left
 
 
 def test_budget_scales_with_time_left(monkeypatch):
@@ -287,8 +293,14 @@ def test_budget_scales_with_time_left(monkeypatch):
     monkeypatch.delenv("EXPECTED_QUESTIONS_PER_DAY", raising=False)
     monkeypatch.delenv("SEASON_END_DATE", raising=False)
     # Same balance, different runway: late in the season it can spend freely.
+    # With October 2026 production costs (~$0.10 per high-effort forecast) and
+    # 8 questions a day, $78 in mid-October buys one high-effort forecast, two
+    # on MiniBench...
     tight = botmain.plan_for_budget(78, OCT)
-    assert (tight.main, tight.mini, tight.effort_cap) == (1, 2, "medium")
+    assert (tight.main, tight.mini, tight.effort_cap) == (1, 2, None)
+    # ...and $40 only a medium-effort one.
+    lean = botmain.plan_for_budget(40, OCT)
+    assert (lean.main, lean.mini, lean.effort_cap) == (1, 1, "medium")
     assert botmain.plan_for_budget(78, DEC).main >= 2
     # A big top-up unlocks full strength even with a long season left.
     full = botmain.plan_for_budget(800, OCT)
@@ -307,12 +319,22 @@ def test_budget_scales_with_time_left(monkeypatch):
 
 def test_season_end_rolls_over_and_can_be_overridden(monkeypatch):
     monkeypatch.delenv("SEASON_END_DATE", raising=False)
-    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2027, 1, 6)
-    assert botmain.season_end(dt.date(2027, 2, 1)) == dt.date(2027, 5, 6)
+    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2026, 12, 31)
+    assert botmain.season_end(dt.date(2027, 2, 1)) == dt.date(2027, 4, 30)
+    assert botmain.season_end(dt.date(2027, 6, 1)) == dt.date(2027, 8, 31)
     monkeypatch.setenv("SEASON_END_DATE", "2027-03-01")
     assert botmain.season_end(dt.date(2027, 2, 1)) == dt.date(2027, 3, 1)
     monkeypatch.setenv("SEASON_END_DATE", "not-a-date")
-    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2027, 1, 6)
+    assert botmain.season_end(dt.date(2026, 10, 11)) == dt.date(2026, 12, 31)
+
+
+def test_end_of_season_does_not_blow_the_budget(monkeypatch):
+    # One day before the assumed end, the budget is still spread over a week
+    # of questions, not the last day's eight...
+    assert botmain.affordable_per_question(56, dt.date(2026, 12, 30), 8) == 1.0
+    # ...and the same once an overridden end date has passed but questions keep coming.
+    monkeypatch.setenv("SEASON_END_DATE", "2026-12-20")
+    assert botmain.affordable_per_question(56, dt.date(2026, 12, 28), 8) == 1.0
 
 
 def test_retired_models_are_reported(monkeypatch):
@@ -592,3 +614,117 @@ def test_model_check_honours_parser_override(monkeypatch):
     monkeypatch.setenv("PARSER_MODELS", "openrouter/openai/custom-parser")
     configured = maintenance.configured_model_ids()
     assert "openai/custom-parser" in configured and "openai/gpt-4o-mini" not in configured
+
+
+# ---------------- spending ledger and measured budget plan ----------------
+import ledger  # noqa: E402
+
+NOW = dt.datetime(2026, 10, 29, 12, tzinfo=dt.timezone.utc)
+
+
+def test_ledger_measures_rate_share_and_cost():
+    book = ledger.Ledger()
+    # 3 days, 4 main questions/day plus 1 MiniBench question a day
+    for d in range(3):
+        for h in range(4):
+            book.record_seen(f"m{d}{h}", "main", NOW - dt.timedelta(days=d, hours=h * 3))
+        book.record_seen(f"b{d}", "minibench", NOW - dt.timedelta(days=d, hours=1))
+    book.record_seen("m00", "main", NOW)  # seen again: not double counted
+    for i in range(5):
+        book.record_spend("high", 1, 1, 0.20, NOW - dt.timedelta(hours=i))
+    stats = book.stats(NOW)
+    assert stats.measured
+    assert 4.5 < stats.questions_per_day < 6.5  # 15 questions over ~2.9 days
+    assert abs(stats.minibench_share - 3 / 15) < 1e-9
+    assert abs(stats.slot_cost["high"] - 0.20) < 1e-9
+    # medium had no data, so it is scaled from high at the priors' ratio
+    assert abs(stats.slot_cost["medium"] - 0.20 * 0.6) < 1e-9
+
+
+def test_ledger_uses_totals_so_balance_lag_washes_out():
+    book = ledger.Ledger()
+    # the balance lagged: one batch looked free, the next paid for both
+    for usd in (0.0, 0.24, 0.12, 0.12):
+        book.record_spend("high", 2, 1, usd, NOW)
+    assert abs(book.stats(NOW).slot_cost["high"] - 0.06) < 1e-9
+
+
+def test_ledger_priors_until_enough_data():
+    stats = ledger.Ledger().stats(NOW)
+    assert not stats.measured and stats.questions_per_day == ledger.PRIOR_QUESTIONS_PER_DAY
+    book = ledger.Ledger()
+    book.record_seen("q", "main", NOW - dt.timedelta(hours=5))  # under 2 days of history
+    book.record_spend("high", 1, 1, 9.99, NOW)  # one slot is not a measurement
+    stats = book.stats(NOW)
+    assert stats.questions_per_day == ledger.PRIOR_QUESTIONS_PER_DAY
+    assert stats.slot_cost == ledger.PRIOR_SLOT_COST
+
+
+def test_ledger_round_trip_prune_and_corruption(tmp_path):
+    path = tmp_path / "l.json"
+    book = ledger.Ledger()
+    book.record_seen("old", "main", NOW - dt.timedelta(days=40))
+    book.record_seen("new", "main", NOW)
+    book.record_spend("high", 1, 1, 0.1, NOW)
+    book.record_spend("high", 1, 0, 0.1, NOW)  # nothing forecast: ignored
+    book.save(path, NOW)
+    again = ledger.Ledger.load(path)
+    assert list(again.seen) == ["new"] and len(again.spend) == 1
+    path.write_text("{not json")
+    assert ledger.Ledger.load(path).seen == {}  # corrupt file never stops forecasting
+
+
+def test_plan_follows_measured_costs():
+    cheap = ledger.Stats(8.0, 0.25, {"high": 0.03, "medium": 0.02}, True)
+    pricey = ledger.Stats(8.0, 0.25, {"high": 0.40, "medium": 0.25}, True)
+    assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), cheap).main == 3
+    plan = botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), pricey)
+    assert (plan.main, plan.mini, plan.effort_cap) == (1, 1, "medium")  # never below coverage
+    # fewer questions than assumed means more per question
+    quiet = ledger.Stats(1.0, 0.25, {"high": 0.10, "medium": 0.06}, True)
+    assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), quiet).main >= 2
+
+
+def test_question_rate_override(monkeypatch):
+    stats = ledger.Stats(1.0, 0.25, {"high": 0.10, "medium": 0.06}, True)
+    monkeypatch.setenv("EXPECTED_QUESTIONS_PER_DAY", "40")
+    assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), stats).effort_cap == "medium"
+
+
+def test_run_feeds_the_ledger(monkeypatch):
+    balance = {"usd": 50.0}
+    monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: balance["usd"])
+    monkeypatch.setattr(
+        botmain, "fetch_open_questions",
+        lambda bot, t: [binary_q_n(21)] if t == botmain.MINIBENCH else [binary_q_n(22), binary_q_n(23)])
+
+    async def forecast(self, questions, return_exceptions=True):
+        balance["usd"] -= 0.1 * len(questions)
+        return [object() for _ in questions]
+
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_questions", forecast)
+    run(botmain.run("tournament", publish=False))
+    book = ledger.Ledger.load()
+    assert {k: v["tournament"] for k, v in book.seen.items()} == {"21": "minibench", "22": "main", "23": "main"}
+    assert [round(s["usd"], 3) for s in book.spend] == [0.1, 0.2]
+    assert sum(s["questions"] for s in book.spend) == 3
+
+
+def test_practice_runs_do_not_feed_the_ledger(monkeypatch):
+    monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: 50.0)
+    monkeypatch.setattr(botmain, "fetch_open_questions", lambda bot, t: [binary_q_n(31)])
+
+    async def forecast(self, questions, return_exceptions=True):
+        return [object() for _ in questions]
+
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_questions", forecast)
+    run(botmain.run("test_questions", publish=False))
+    assert not ledger.ledger_path().exists()
+
+
+def test_numeric_tails_are_used_when_given():
+    text = "\n".join(f"Percentile {p}: {v}" for p, v in zip([5, 10, 20, 40, 60, 80, 90, 95], range(1, 9)))
+    assert [p.percentile for p in botmain.parse_numeric(text)] == [0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95]
+    from forecasting_tools import NumericDistribution
+    dist = NumericDistribution.from_question(botmain.parse_numeric(text.replace(": ", ": 1")), numeric_q())
+    assert len(dist.get_cdf()) > 100

@@ -30,6 +30,15 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
+      # The spending ledger (ledger.py): measured cost per forecast and question
+      # rate, carried from run to run so the budget plan rests on real numbers.
+      # Each run saves a new entry; restore picks the most recent one.
+      - name: Restore spending ledger
+        uses: actions/cache/restore@v4
+        with:
+          path: .ledger
+          key: ledger-${{ github.run_id }}
+          restore-keys: ledger-
       - name: Forecast (Fall tournament + MiniBench)
         run: python main.py --mode tournament
         env:
@@ -55,3 +64,10 @@ jobs:
           # How long one run keeps polling, and how often it looks.
           WATCH_MINUTES: ${{ vars.WATCH_MINUTES || '300' }}
           WATCH_INTERVAL_SECONDS: ${{ vars.WATCH_INTERVAL_SECONDS || '300' }}
+      - name: Save spending ledger
+        if: always()
+        continue-on-error: true  # losing the ledger only costs the measurements
+        uses: actions/cache/save@v4
+        with:
+          path: .ledger
+          key: ledger-${{ github.run_id }}
