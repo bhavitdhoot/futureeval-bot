@@ -88,15 +88,25 @@ logger = logging.getLogger("forecast-bot")
 MINIBENCH = "minibench"
 TEST_AREA = "bot-testing-area"
 
-# Slugs verified in use on OpenRouter in September 2026. Order matters.
+# Each roster slot lists candidates newest first, separated by "|"; the bot
+# uses the first one OpenRouter currently lists (see resolve_model), and the
+# last one, verified in production, if the catalog can't be read. So a newer
+# model is picked up the day it appears, and a wrong guess costs nothing.
+# Candidates as of October 2026: Claude Opus 5.5 and the GPT-6 / Gemini 4
+# names come from OpenRouter's migration guides and listings; gpt-5.6-sol and
+# claude-opus-4.8 ran in production this season.
+# Three vendors, because an ensemble gains most from members that err
+# differently ("Diversity is the Strength of the AI Crowd", 2026); with fewer
+# forecasts per question the later slots are the first fallbacks.
 DEFAULT_PRIMARY = [
-    ("openrouter/openai/gpt-5.6-sol", "high"),
-    ("openrouter/anthropic/claude-opus-4.8", "high"),
+    ("openrouter/openai/gpt-6.1-sol|openrouter/openai/gpt-6-sol|openrouter/openai/gpt-5.6-sol", "high"),
+    ("openrouter/anthropic/claude-opus-5.5|openrouter/anthropic/claude-opus-5|openrouter/anthropic/claude-opus-4.8", "high"),
+    ("openrouter/google/gemini-4-argon|openrouter/google/gemini-3.1-pro-preview", "high"),
 ]
 DEFAULT_BACKUPS = [
+    ("openrouter/openai/gpt-5.6-sol", "high"),
+    ("openrouter/anthropic/claude-opus-4.8", "high"),
     ("openrouter/openai/gpt-5.5", "high"),
-    ("openrouter/anthropic/claude-opus-4.7", "high"),
-    ("openrouter/openai/gpt-5.6-luna", "high"),
 ]
 DEFAULT_PARSERS = [
     "openrouter/openai/gpt-4.1-mini",  # the framework's own default parser
@@ -128,8 +138,42 @@ def _env(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
+_catalog_cache: set[str] | None = None
+_catalog_read = False
+_resolved_logged: set[str] = set()
+
+
+def _catalog() -> set[str] | None:
+    """OpenRouter's public model list, read once per process. None if unreadable."""
+    global _catalog_cache, _catalog_read
+    if not _catalog_read:
+        _catalog_read = True
+        _catalog_cache = maintenance.fetch_available_models()
+    return _catalog_cache
+
+
+def resolve_model(spec: str) -> str:
+    """The first candidate in "a|b|c" that OpenRouter lists, else the last (known-good) one."""
+    candidates = [c.strip() for c in spec.split("|") if c.strip()]
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else spec
+    chosen = candidates[-1]
+    available = _catalog()
+    if available:
+        listed = [c for c in candidates if maintenance.openrouter_id(c) in available]
+        if listed:
+            chosen = listed[0]
+        else:
+            logger.warning(f"None of {candidates} is listed on OpenRouter; trying {chosen}")
+    if spec not in _resolved_logged:
+        _resolved_logged.add(spec)
+        logger.info(f"Model slot {spec!r} -> {chosen}")
+    return chosen
+
+
 def research_models() -> list[str]:
-    return [m.strip() for m in _env("RESEARCH_MODELS").split(",") if m.strip()] or DEFAULT_RESEARCH
+    raw = [m.strip() for m in _env("RESEARCH_MODELS").split(",") if m.strip()] or DEFAULT_RESEARCH
+    return [resolve_model(m) for m in raw]
 
 
 def _parse_model_list(env_name: str, default: list[tuple[str, str | None]]):
@@ -166,7 +210,7 @@ def make_llm(model: str, effort: str | None = None, **overrides) -> GeneralLlm:
     params.update(overrides)
     if effort and effort.lower() != "none":
         params["reasoning"] = {"effort": effort}
-    return GeneralLlm(model=model, **params)
+    return GeneralLlm(model=resolve_model(model), **params)
 
 
 def _identity(llm: GeneralLlm) -> tuple[str, str]:
@@ -266,7 +310,7 @@ def build_roster(n_predictions: int, effort_cap: str | None = None) -> RosterLlm
 
 def build_parser_llm() -> RosterLlm:
     names = [m for m, _ in _parse_model_list("PARSER_MODELS", [(p, None) for p in DEFAULT_PARSERS])]
-    llms = [GeneralLlm(model=m, temperature=None, timeout=120, allowed_tries=2) for m in names]
+    llms = [GeneralLlm(model=resolve_model(m), temperature=None, timeout=120, allowed_tries=2) for m in names]
     return RosterLlm(llms[:1], llms[1:])
 
 

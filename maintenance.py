@@ -139,29 +139,42 @@ def check(
     return problems
 
 
+def openrouter_id(name: str) -> str:
+    """"openrouter/openai/x:online" -> "openai/x", as OpenRouter's catalog lists it."""
+    return name.strip().split("openrouter/", 1)[-1].split(":online")[0]
+
+
 def configured_model_ids() -> list[str]:
-    """Every model the bot might call, as OpenRouter ids (no provider prefix)."""
+    """
+    Every model slot the bot might call, as OpenRouter ids. A slot with
+    several candidates ("a|b") comes back as one "a|b" entry: it only fails
+    when none of them is listed.
+    """
     import main  # imported lazily so maintenance stays importable on its own
 
     specs = [
         *main._parse_model_list("FORECAST_MODELS", main.DEFAULT_PRIMARY),
         *main._parse_model_list("BACKUP_MODELS", main.DEFAULT_BACKUPS),
         *main._parse_model_list("PARSER_MODELS", [(m, None) for m in main.DEFAULT_PARSERS]),
-        *[(m, None) for m in main.research_models()],
+        *[(m, None) for m in (_env_list("RESEARCH_MODELS") or main.DEFAULT_RESEARCH)],
     ]
     ids = []
     for name, _ in specs:
-        clean = name.split("openrouter/", 1)[-1].split(":online")[0]
+        clean = "|".join(openrouter_id(c) for c in name.split("|") if c.strip())
         if clean not in ids:
             ids.append(clean)
     return ids
 
 
+def _env_list(name: str) -> list[str]:
+    return [x.strip() for x in os.getenv(name, "").split(",") if x.strip()]
+
+
 def missing_models(available: set[str] | None, configured: list[str]) -> list[str]:
-    """Which configured models OpenRouter no longer lists. None means unknown."""
+    """Which configured slots have no candidate OpenRouter still lists. None means unknown."""
     if not available:
         return []
-    return [m for m in configured if m not in available]
+    return [slot for slot in configured if not any(c in available for c in slot.split("|"))]
 
 
 def fetch_available_models() -> set[str] | None:

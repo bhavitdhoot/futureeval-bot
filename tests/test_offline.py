@@ -31,8 +31,11 @@ from forecasting_tools.data_models.questions import (  # noqa: E402
 
 import ledger  # noqa: E402
 import main as botmain  # noqa: E402
+import maintenance  # noqa: E402
 
-GPT, CLAUDE = botmain.DEFAULT_PRIMARY[0][0], botmain.DEFAULT_PRIMARY[1][0]
+# With OpenRouter's catalog unreadable (as in these offline tests), each slot
+# resolves to its last, known-good candidate.
+GPT, CLAUDE, GEMINI = (spec.split("|")[-1] for spec, _ in botmain.DEFAULT_PRIMARY)
 PROB = {GPT: 30, CLAUDE: 50}  # each model's "opinion" on the binary question
 BROKEN: set[str] = set()      # models that should raise
 TRUNCATED: set[str] = set()   # models that stop before their final answer
@@ -76,6 +79,13 @@ async def fake_invoke(self, prompt, system_prompt=None):
     if "Option_A" in text or "Red" in text and "Blue" in text:
         return "Reasoning...\nRed: 20%\nGreen: 30%\nBlue: 50%"
     return f"Reasoning about the question...\nProbability: {p}%"
+
+
+@pytest.fixture(autouse=True)
+def offline_catalog(monkeypatch):
+    monkeypatch.setattr(maintenance, "fetch_available_models", lambda: None)
+    monkeypatch.setattr(botmain, "_catalog_read", False)
+    monkeypatch.setattr(botmain, "_catalog_cache", None)
 
 
 @pytest.fixture(autouse=True)
@@ -135,12 +145,16 @@ def test_fallback_when_one_vendor_is_down():
     assert GPT in CALLS  # it was tried first, then skipped
 
 
-def test_backups_when_both_primaries_down():
+def test_third_vendor_then_backups_when_primaries_down():
     BROKEN.update({GPT, CLAUDE})
     bot = botmain.make_bot(2, publish=False)
     report = run(bot.forecast_question(binary_q()))
     assert 0 < report.prediction < 1
-    assert botmain.DEFAULT_BACKUPS[0][0] in CALLS
+    assert set(bot.get_llm("default", "llm").usage_log) == {GEMINI}
+    BROKEN.add(GEMINI)
+    CALLS.clear()
+    report = run(botmain.make_bot(2, publish=False).forecast_question(binary_q()))
+    assert "openrouter/openai/gpt-5.5" in CALLS and 0 < report.prediction < 1
 
 
 def test_binary_parsed_locally_without_parser_calls():
@@ -164,7 +178,7 @@ def test_parser_fallback():
 
 
 def test_everything_down_raises_instead_of_publishing_garbage():
-    BROKEN.update({GPT, CLAUDE} | {m for m, _ in botmain.DEFAULT_BACKUPS})
+    BROKEN.update({GPT, CLAUDE, GEMINI} | {m for m, _ in botmain.DEFAULT_BACKUPS})
     bot = botmain.make_bot(2, publish=False)
     with pytest.raises(BaseException):
         run(bot.forecast_question(binary_q()))
@@ -214,13 +228,13 @@ def test_env_override_of_models(monkeypatch):
     assert "reasoning" not in roster.primaries[1].litellm_kwargs
 
 
-def test_full_mode_repeats_roster():
+def test_full_mode_uses_three_vendors():
     roster = botmain.build_roster(3)
-    assert [m.model for m in roster.primaries] == [GPT, CLAUDE, GPT]
+    assert [m.model for m in roster.primaries] == [GPT, CLAUDE, GEMINI]
+    assert [m.model for m in botmain.build_roster(4).primaries][3] == GPT  # repeats past three
 
 
 # ---------------- tournament discovery & maintenance ----------------
-import maintenance  # noqa: E402
 
 EXISTING = {33121, "fall-futureeval-2026", "minibench", "spring-futureeval-2027"}
 
@@ -342,10 +356,13 @@ def test_end_of_season_does_not_blow_the_budget(monkeypatch):
 def test_retired_models_are_reported(monkeypatch):
     monkeypatch.delenv("FORECAST_MODELS", raising=False)
     configured = maintenance.configured_model_ids()
-    assert "openai/gpt-5.6-sol" in configured and "anthropic/claude-opus-4.8" in configured
-    assert all(not m.startswith("openrouter/") and ":online" not in m for m in configured)
-    available = set(configured) - {"openai/gpt-5.6-sol"}
-    assert maintenance.missing_models(available, configured) == ["openai/gpt-5.6-sol"]
+    assert "openai/gpt-6.1-sol|openai/gpt-6-sol|openai/gpt-5.6-sol" in configured
+    assert all("openrouter/" not in m and ":online" not in m for m in configured)
+    available = {c for slot in configured for c in slot.split("|")} - {"openai/gpt-5.6-sol"}
+    assert maintenance.missing_models(available, configured) == ["openai/gpt-5.6-sol"]  # the backup slot
+    # a multi-candidate slot only fails when none of its candidates is listed
+    available -= {"openai/gpt-6.1-sol", "openai/gpt-6-sol"}
+    assert "openai/gpt-6.1-sol|openai/gpt-6-sol|openai/gpt-5.6-sol" in maintenance.missing_models(available, configured)
     assert maintenance.missing_models(None, configured) == []      # unknown, never alarms
     t = maintenance.discover(dt.date(2026, 10, 11), fake_probe)
     problems = maintenance.check(t, dt.date(2026, 10, 11), 300, ["openai/gpt-5.6-sol"])
@@ -482,7 +499,7 @@ def test_single_prediction_keeps_other_flagship_as_first_fallback():
 
 
 def test_fallback_chain_has_no_repeats():
-    roster = botmain.build_roster(3)  # [GPT, CLAUDE, GPT]
+    roster = botmain.build_roster(4)  # [GPT, CLAUDE, GEMINI, GPT]
     for k in range(3):
         models = [m.model for m in roster.chain(k)]
         assert len(models) == len(set(models)), models
@@ -807,3 +824,28 @@ def test_multiple_choice_names_match_exactly():
 def test_bad_extremize_setting_does_not_block_forecasts(monkeypatch):
     monkeypatch.setenv("BINARY_EXTREMIZE", "1.2x")
     assert abs(botmain.pool_binary([0.3, 0.3]) - 0.3) < 1e-9
+
+
+# ---------------- runtime model resolution ----------------
+def test_newest_listed_candidate_wins(monkeypatch):
+    monkeypatch.setattr(maintenance, "fetch_available_models",
+                        lambda: {"openai/gpt-6-sol", "openai/gpt-5.6-sol", "anthropic/claude-opus-5.5"})
+    assert botmain.resolve_model(botmain.DEFAULT_PRIMARY[0][0]) == "openrouter/openai/gpt-6-sol"
+    assert botmain.resolve_model(botmain.DEFAULT_PRIMARY[1][0]) == "openrouter/anthropic/claude-opus-5.5"
+    # nothing listed: fall back to the known-good last candidate
+    assert botmain.resolve_model(botmain.DEFAULT_PRIMARY[2][0]) == GEMINI
+    assert botmain.resolve_model("openrouter/x/y") == "openrouter/x/y"
+
+
+def test_catalog_is_read_once_per_process(monkeypatch):
+    reads = []
+    monkeypatch.setattr(maintenance, "fetch_available_models", lambda: reads.append(1) or {"openai/gpt-6-sol"})
+    botmain.build_roster(3)
+    botmain.build_roster(3)
+    assert len(reads) == 1
+
+
+def test_research_candidates_resolve_with_online_suffix(monkeypatch):
+    monkeypatch.setattr(maintenance, "fetch_available_models", lambda: {"openai/new-search"})
+    monkeypatch.setenv("RESEARCH_MODELS", "openrouter/openai/new-search:online|openrouter/openai/old:online")
+    assert botmain.research_models() == ["openrouter/openai/new-search:online"]

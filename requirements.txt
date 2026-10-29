@@ -1,5 +1,5 @@
 # Fully pinned for reproducible GitHub Actions runs (Python 3.12, ubuntu-latest).
-# Generated from a verified environment; forecasting-tools 0.3.1 has the Fall 2026 tournament ID.
+# Generated from a verified environment; forecasting-tools 0.3.5: Fall 2026 tournament ID, 0.1% multiple-choice floor, no retries on 4xx.
 aiofiles==25.1.0
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.3
@@ -25,7 +25,7 @@ email-validator==2.3.0
 exceptiongroup==1.3.1
 fastuuid==0.14.0
 filelock==4.0.1
-forecasting-tools==0.3.1
+forecasting-tools==0.3.5
 frozenlist==1.8.0
 fsspec==2026.9.0
 h11==0.16.0
