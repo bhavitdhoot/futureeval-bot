@@ -145,6 +145,9 @@ EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"]
 # ECONOMY_MAX_TOKENS, 25% above production's proven 8k.
 MAX_TOKENS = 32000
 ECONOMY_MAX_TOKENS = 10000
+# Seconds to wait after research before reading the balance, so its charges
+# have posted when research cost is measured that way.
+RESEARCH_SETTLE_SECONDS = 5
 
 
 def _env(name: str) -> str:
@@ -546,6 +549,7 @@ class FutureEvalBot(SummerTemplateBot2026):
     # forecast's published config from the __init__ signature.
     use_asknews = False
     research_costs: dict[str, float]  # question key -> USD, set per bot in make_bot
+    measure_research_by_balance = False  # set by run() when one question is in flight
     # With AskNews configured, also run web search (news alone misses base
     # rates, official data and schedules). Without AskNews, web search is the
     # only source and always runs.
@@ -553,12 +557,22 @@ class FutureEvalBot(SummerTemplateBot2026):
 
     # ------------------------------ research ------------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
-        # Exact research cost (OpenRouter reports each call's cost; the
-        # manager is per task, so concurrent questions don't mix). Feeds the
-        # ledger's research/forecast split.
+        # Research cost, for the ledger's research/forecast split. Per-call
+        # cost reports are used when litellm provides them (the manager is per
+        # task, so concurrent questions don't mix); they come back empty for
+        # the current OpenRouter models, so with one question in flight the
+        # balance is read around research instead.
+        before = maintenance.fetch_credits_remaining() if self.measure_research_by_balance else None
         with MonetaryCostManager() as cost:
             research = await self._run_research(question)
-        self.research_costs[question_key(question)] = self.research_costs.get(question_key(question), 0.0) + cost.current_usage
+        spent = cost.current_usage
+        if before is not None:
+            await asyncio.sleep(RESEARCH_SETTLE_SECONDS)  # let the charges post
+            after = maintenance.fetch_credits_remaining()
+            if after is not None:
+                spent = max(spent, before - after, 0.0)
+        key = question_key(question)
+        self.research_costs[key] = self.research_costs.get(key, 0.0) + spent
         return research
 
     async def _run_research(self, question: MetaculusQuestion) -> str:
@@ -861,7 +875,8 @@ PLANS = [
     (1, 1, False, None, False, "one flagship forecast"),
     (1, 2, True, None, False, "previous generation, MiniBench keeps the ensemble"),
     (1, 1, True, None, False, "one previous-generation forecast"),
-    (1, 1, True, "medium", False, "minimum viable coverage"),
+    (1, 1, True, "medium", False, "one medium-effort previous-generation forecast"),
+    (1, 1, True, "low", False, "minimum viable coverage"),
 ]
 # The plan is re-chosen every five minutes from the live balance, so running
 # slightly hot corrects itself; this stops it flapping between two plans.
@@ -1023,13 +1038,26 @@ async def run(mode: str, publish: bool) -> int:
         # Chain readings: a batch starts from the previous batch's closing
         # balance, so a late charge lands in the next batch, not in a gap.
         before = (_balance_mark if _balance_mark is not None else maintenance.fetch_credits_remaining()) if live else None
+        # With one question in flight (the usual case: the main tournament
+        # opens one at a time), research cost can be read off the balance.
+        bot.measure_research_by_balance = before is not None and len(questions) == 1
         # select_questions already applied the framework's skip filter, so
         # reports line up one-to-one with questions.
         reports = await bot.forecast_questions(questions, return_exceptions=True)
+        bot.measure_research_by_balance = False
         after = maintenance.fetch_credits_remaining() if live else None
         research_usd, tracked_usd = log_costs(bot, questions, reports)
         if before is not None and after is not None:
             slots = plan.mini if bot is mini_bot else plan.main
+            batch_usd = max(before - after, 0.0)
+            if tracked_usd <= 0 and len(questions) == 1 and batch_usd > 0:
+                # No per-call costs: split the balance drop instead.
+                research_usd = min(bot.research_costs.get(question_key(questions[0]), 0.0), batch_usd)
+                tracked_usd = batch_usd
+                logger.info(
+                    f"Cost for {questions[0].page_url}: ${batch_usd:.3f} (research ${research_usd:.3f}, "
+                    f"forecasting ${batch_usd - research_usd:.3f}; from the balance)"
+                )
             share = research_usd / tracked_usd if tracked_usd > 0 else None
             book.record_spend(plan.effort_label, slots, len(questions), before - after, research_share=share)
             _balance_mark = after

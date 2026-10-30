@@ -103,6 +103,7 @@ def patch_llm(monkeypatch):
     botmain._attempts.clear()
     botmain._done.clear()
     botmain._balance_mark = None
+    monkeypatch.setattr(botmain, "RESEARCH_SETTLE_SECONDS", 0)
     for var in ("BINARY_EXTREMIZE", "PARSER_MODELS", "RESEARCH_MODELS", "BACKUP_MODELS"):
         monkeypatch.delenv(var, raising=False)
 
@@ -309,15 +310,16 @@ def test_budget_scales_with_time_left(monkeypatch):
     monkeypatch.delenv("EXPECTED_QUESTIONS_PER_DAY", raising=False)
     monkeypatch.delenv("SEASON_END_DATE", raising=False)
     # Same balance, different runway: late in the season it can spend freely.
-    # At the priors (flagship ~$0.30, previous generation ~$0.10 per forecast)
-    # and 8 questions a day, $78 in mid-October buys the previous generation at
-    # high effort, two forecasts on MiniBench...
+    # At the priors (measured in production and on the practice tournament)
+    # and 8 questions a day, $78 in mid-October sustains the previous
+    # generation at medium effort...
     tight = botmain.plan_for_budget(78, OCT)
-    assert (tight.main, tight.mini, tight.effort_cap, tight.economy) == (1, 2, None, True)
-    # ...and $40 only the medium-effort last resort.
+    assert (tight.main, tight.mini, tight.effort_cap, tight.economy) == (1, 1, "medium", True)
+    # ...and $40 only the low-effort floor.
     lean = botmain.plan_for_budget(40, OCT)
-    assert (lean.main, lean.mini, lean.effort_cap, lean.economy) == (1, 1, "medium", True)
-    assert botmain.plan_for_budget(78, DEC).main >= 2
+    assert (lean.main, lean.mini, lean.effort_cap, lean.economy) == (1, 1, "low", True)
+    late = botmain.plan_for_budget(78, DEC)
+    assert not late.economy and late.mini == 2  # late in the season it can spend freely
     # A big top-up unlocks full strength even with a long season left.
     full = botmain.plan_for_budget(800, OCT)
     assert (full.main, full.mini, full.effort_cap, full.web_research, full.economy) == (3, 2, None, True, False)
@@ -722,7 +724,7 @@ def test_plan_follows_measured_costs():
     pricey = ledger.Stats(8.0, 0.25, {ledger.UNCAPPED: 0.40, ledger.ECONOMY: 0.25, ledger.ECONOMY_MEDIUM: 0.15}, True)
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), cheap).main == 3
     plan = botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), pricey)
-    assert (plan.main, plan.mini, plan.effort_cap, plan.economy) == (1, 1, "medium", True)  # never below coverage
+    assert (plan.main, plan.mini, plan.effort_cap, plan.economy) == (1, 1, "low", True)  # never below coverage
     # fewer questions than assumed means more per question
     quiet = ledger.Stats(1.0, 0.25, dict(ledger.PRIOR_SLOT_COST), True)
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), quiet).main >= 2
@@ -731,7 +733,7 @@ def test_plan_follows_measured_costs():
 def test_question_rate_override(monkeypatch):
     stats = ledger.Stats(1.0, 0.25, dict(ledger.PRIOR_SLOT_COST), True)
     monkeypatch.setenv("EXPECTED_QUESTIONS_PER_DAY", "40")
-    assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), stats).effort_cap == "medium"
+    assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), stats).effort_cap == "low"
 
 
 def test_run_feeds_the_ledger(monkeypatch):
@@ -861,9 +863,10 @@ def test_tight_budget_switches_to_previous_generation_at_high_effort():
     assert all(m.litellm_kwargs["max_tokens"] == botmain.ECONOMY_MAX_TOKENS for m in roster.primaries + roster.backups)
     flagship = botmain.make_bot(1, publish=False).get_llm("default", "llm")
     assert flagship.primaries[0].litellm_kwargs["max_tokens"] == botmain.MAX_TOKENS
-    # today's balance keeps high effort on the previous generation
-    plan = botmain.plan_for_budget(41.55, dt.date(2026, 10, 29))
-    assert (plan.main, plan.economy, plan.effort_cap) == (1, True, None)
+    # Production's real costs ($0.25 at high effort): the balance on 2026-10-30
+    # sustains only the low-effort floor to the season's end.
+    plan = botmain.plan_for_budget(40.11, dt.date(2026, 10, 30))
+    assert (plan.main, plan.economy, plan.effort_cap) == (1, True, "low")
     assert ledger.bucket(True, None) == ledger.ECONOMY and ledger.bucket(False, None) == ledger.UNCAPPED
 
 
@@ -994,3 +997,27 @@ def test_research_cost_is_tracked_per_question():
     bot = botmain.make_bot(1, publish=False)
     run(bot.run_research(binary_q_n(61)))
     assert "61" in bot.research_costs
+
+
+def test_research_cost_is_read_off_the_balance_for_a_single_question(monkeypatch):
+    balance = {"usd": 40.0}
+    monkeypatch.setattr(maintenance, "fetch_credits_remaining", lambda: balance["usd"])
+    monkeypatch.setattr(botmain, "fetch_open_questions",
+                        lambda bot, t: [] if t == botmain.MINIBENCH else [binary_q_n(71)])
+    orig_research = botmain.FutureEvalBot._run_research
+
+    async def research(self, question):
+        balance["usd"] -= 0.10  # web search
+        return await orig_research(self, question)
+
+    async def forecast(self, questions, return_exceptions=True):
+        for q in questions:
+            await self.run_research(q)
+        balance["usd"] -= 0.15  # reasoning
+        return [object() for _ in questions]
+
+    monkeypatch.setattr(botmain.FutureEvalBot, "_run_research", research)
+    monkeypatch.setattr(botmain.FutureEvalBot, "forecast_questions", forecast)
+    run(botmain.run("tournament", publish=False))
+    row = ledger.Ledger.load().spend[0]
+    assert round(row["usd"], 3) == 0.25 and abs(row["research_share"] - 0.4) < 1e-6
