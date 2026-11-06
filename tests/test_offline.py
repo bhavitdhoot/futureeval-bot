@@ -273,7 +273,11 @@ def test_check_alerts_on_low_credits_only():
     t = maintenance.discover(dt.date(2026, 10, 1), fake_probe)
     assert maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=300) == []
     assert maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=None) == []
-    assert any("credits are low" in p for p in maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=10))
+    # low credits are a warning, not a failure, until the bot has to pause
+    assert maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=10) == []
+    assert "credits are low" in maintenance.credit_warning(10)
+    assert maintenance.credit_warning(300) is None
+    assert any("nearly gone" in p for p in maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=3))
 
 
 def test_empty_env_vars_behave_like_unset(monkeypatch):
@@ -282,7 +286,7 @@ def test_empty_env_vars_behave_like_unset(monkeypatch):
         monkeypatch.setenv(var, "")
     t = maintenance.discover(dt.date(2026, 10, 1), fake_probe)
     assert maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=300) == []
-    assert any("credits are low" in p for p in maintenance.check(t, dt.date(2026, 10, 1), credits_remaining=10))
+    assert "credits are low" in maintenance.credit_warning(10)
     assert [m.model for m in botmain.build_roster(2).primaries] == [GPT, CLAUDE]
 
 
@@ -315,9 +319,9 @@ def test_budget_scales_with_time_left(monkeypatch):
     # generation at medium effort...
     tight = botmain.plan_for_budget(78, OCT)
     assert (tight.main, tight.mini, tight.effort_cap, tight.economy) == (1, 1, "medium", True)
-    # ...and $40 only the low-effort floor.
+    # ...and $40 only the small-model tier.
     lean = botmain.plan_for_budget(40, OCT)
-    assert (lean.main, lean.mini, lean.effort_cap, lean.economy) == (1, 1, "low", True)
+    assert lean.lite and lean.main == 1
     late = botmain.plan_for_budget(78, DEC)
     assert not late.economy and late.mini == 2  # late in the season it can spend freely
     # A big top-up unlocks full strength even with a long season left.
@@ -724,7 +728,7 @@ def test_plan_follows_measured_costs():
     pricey = ledger.Stats(8.0, 0.25, {ledger.UNCAPPED: 0.40, ledger.ECONOMY: 0.25, ledger.ECONOMY_MEDIUM: 0.15}, True)
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), cheap).main == 3
     plan = botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), pricey)
-    assert (plan.main, plan.mini, plan.effort_cap, plan.economy) == (1, 1, "low", True)  # never below coverage
+    assert plan.lite and plan.main == 1  # never below coverage
     # fewer questions than assumed means more per question
     quiet = ledger.Stats(1.0, 0.25, dict(ledger.PRIOR_SLOT_COST), True)
     assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), quiet).main >= 2
@@ -733,7 +737,7 @@ def test_plan_follows_measured_costs():
 def test_question_rate_override(monkeypatch):
     stats = ledger.Stats(1.0, 0.25, dict(ledger.PRIOR_SLOT_COST), True)
     monkeypatch.setenv("EXPECTED_QUESTIONS_PER_DAY", "40")
-    assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), stats).effort_cap == "low"
+    assert botmain.plan_for_budget(52.6, dt.date(2026, 10, 29), stats).lite
 
 
 def test_run_feeds_the_ledger(monkeypatch):
@@ -864,9 +868,10 @@ def test_tight_budget_switches_to_previous_generation_at_high_effort():
     flagship = botmain.make_bot(1, publish=False).get_llm("default", "llm")
     assert flagship.primaries[0].litellm_kwargs["max_tokens"] == botmain.MAX_TOKENS
     # Production's real costs ($0.25 at high effort): the balance on 2026-10-30
-    # sustains only the low-effort floor to the season's end.
-    plan = botmain.plan_for_budget(40.11, dt.date(2026, 10, 30))
-    assert (plan.main, plan.economy, plan.effort_cap) == (1, True, "low")
+    # sustains only the small-model tier to the season's end, and $24 on
+    # 2026-11-06 likewise.
+    assert botmain.plan_for_budget(40.11, dt.date(2026, 10, 30)).lite
+    assert botmain.plan_for_budget(24.23, dt.date(2026, 11, 6)).lite
     assert ledger.bucket(True, None) == ledger.ECONOMY and ledger.bucket(False, None) == ledger.UNCAPPED
 
 
@@ -974,8 +979,9 @@ def test_cheaper_research_split_buys_bigger_plans():
     all_slot = ledger.Stats(8.0, 0.25, dict(ledger.PRIOR_SLOT_COST), True)
     split = ledger.Stats(8.0, 0.25, {**ledger.PRIOR_SLOT_COST, ledger.ECONOMY: 0.04}, True, research_cost=0.06)
     today = dt.date(2026, 10, 29)
-    assert botmain.plan_for_budget(45, today, all_slot).mini == 1
-    assert botmain.plan_for_budget(45, today, split).mini == 2
+    assert botmain.plan_for_budget(45, today, all_slot).lite
+    plan = botmain.plan_for_budget(45, today, split)
+    assert plan.economy and plan.mini == 2
 
 
 def test_costs_are_logged_and_split(caplog):
@@ -1021,3 +1027,15 @@ def test_research_cost_is_read_off_the_balance_for_a_single_question(monkeypatch
     run(botmain.run("tournament", publish=False))
     row = ledger.Ledger.load().spend[0]
     assert round(row["usd"], 3) == 0.25 and abs(row["research_share"] - 0.4) < 1e-6
+
+
+def test_lite_roster_is_the_last_resort():
+    roster = botmain.make_bot(1, publish=False, lite=True).get_llm("default", "llm")
+    assert roster.primaries[0].model == botmain.DEFAULT_LITE[0][0].split("|")[0]
+    assert roster.primaries[0].litellm_kwargs["max_tokens"] == botmain.ECONOMY_MAX_TOKENS
+    assert ledger.bucket(False, None, lite=True) == ledger.LITE
+    assert botmain.PLANS[-1][2] == "lite"
+    # with production's measured costs, the small model is the plan $24 can sustain on 2026-11-06
+    stats = ledger.Stats(11.0, 0.25, {**ledger.PRIOR_SLOT_COST, ledger.ECONOMY_LOW: 0.192}, True, research_cost=0.014)
+    plan = botmain.plan_for_budget(24.23, dt.date(2026, 11, 6), stats)
+    assert plan.lite and plan.main == 1

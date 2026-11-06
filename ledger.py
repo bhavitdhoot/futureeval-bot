@@ -39,9 +39,12 @@ UNCAPPED = "uncapped"
 ECONOMY = "economy"
 ECONOMY_MEDIUM = "economy-medium"
 ECONOMY_LOW = "economy-low"
+LITE = "lite"
 
 
-def bucket(economy: bool, effort_cap: str | None) -> str:
+def bucket(economy: bool, effort_cap: str | None, lite: bool = False) -> str:
+    if lite:
+        return f"{LITE}-{effort_cap}" if effort_cap else LITE
     if not economy:
         return effort_cap or UNCAPPED
     return f"{ECONOMY}-{effort_cap}" if effort_cap else ECONOMY
@@ -54,8 +57,10 @@ def bucket(economy: bool, effort_cap: str | None) -> str:
 #   economy: GPT-5.6 Sol at high effort, $0.25 on both the practice tournament
 #     and the first production question with uncontaminated balance readings;
 #   economy-medium: $0.15 on the practice tournament;
-#   economy-low: an estimate, scaled from the medium/high ratio.
-PRIOR_SLOT_COST = {UNCAPPED: 0.35, ECONOMY: 0.25, ECONOMY_MEDIUM: 0.15, ECONOMY_LOW: 0.09}
+#   economy-low: measured in production in early Nov 2026 at $0.19 (it hardly
+#     saves anything over high effort);
+#   lite: a small model (Haiku / Luna class), an estimate until measured.
+PRIOR_SLOT_COST = {UNCAPPED: 0.35, ECONOMY: 0.25, ECONOMY_MEDIUM: 0.15, ECONOMY_LOW: 0.19, LITE: 0.03}
 PRIOR_QUESTIONS_PER_DAY = 8.0
 PRIOR_MINIBENCH_SHARE = 0.25
 KEEP_DAYS = 30
