@@ -108,15 +108,18 @@ def check(
     credits_remaining: float | None,
     gone_models: list[str] | None = None,
 ) -> list[str]:
-    """Return a list of human-readable problems. Empty list means all good."""
+    """
+    Return a list of human-readable problems that need you now (the run fails
+    and GitHub emails you). Low-but-workable credits are a warning instead,
+    see credit_warning: the budget planner already stretches them to the end
+    of the season, so failing the run every few hours about it only buries
+    real breakage.
+    """
     problems = []
-    # GitHub passes unset repo variables as "", so a plain getenv default is not enough.
-    floor = float(os.getenv("CREDIT_FLOOR_USD") or 25)
-    if credits_remaining is not None and credits_remaining < floor:
+    if credits_remaining is not None and credits_remaining < PAUSE_BELOW_USD:
         problems.append(
-            f"OpenRouter credits are low: ${credits_remaining:.2f} left (alert floor ${floor:.0f}). "
-            "Request more through the Metaculus credits form, or set ROSTER_MODE=lean / "
-            "SKIP_MINIBENCH=true to stretch what's left."
+            f"OpenRouter credits are nearly gone: ${credits_remaining:.2f} left, so the bot has "
+            "paused forecasting. Request more through the Metaculus credits form."
         )
     if targets is None:
         problems.append("TARGETS.json is missing: the discover step failed. Check the workflow log.")
@@ -144,6 +147,23 @@ def openrouter_id(name: str) -> str:
     return name.strip().split("openrouter/", 1)[-1].split(":online")[0]
 
 
+# The forecast job pauses below this balance (main.plan_for_budget).
+PAUSE_BELOW_USD = 6.0
+
+
+def credit_warning(credits_remaining: float | None) -> str | None:
+    """A non-fatal note when credits are below CREDIT_FLOOR_USD."""
+    # GitHub passes unset repo variables as "", so a plain getenv default is not enough.
+    floor = float(os.getenv("CREDIT_FLOOR_USD") or 25)
+    if credits_remaining is None or credits_remaining >= floor or credits_remaining < PAUSE_BELOW_USD:
+        return None
+    return (
+        f"OpenRouter credits are low: ${credits_remaining:.2f} left (alert floor ${floor:.0f}). "
+        "The bot is stretching them with cheaper models; request more through the Metaculus "
+        "credits form to restore forecast quality."
+    )
+
+
 def configured_model_ids() -> list[str]:
     """
     Every model slot the bot might call, as OpenRouter ids. A slot with
@@ -155,6 +175,7 @@ def configured_model_ids() -> list[str]:
     specs = [
         *main._parse_model_list("FORECAST_MODELS", main.DEFAULT_PRIMARY),
         *main._parse_model_list("ECONOMY_MODELS", main.DEFAULT_ECONOMY),
+        *main._parse_model_list("LITE_MODELS", main.DEFAULT_LITE),
         *main._parse_model_list("BACKUP_MODELS", main.DEFAULT_BACKUPS),
         *main._parse_model_list("PARSER_MODELS", [(m, None) for m in main.DEFAULT_PARSERS]),
         *[(m, None) for m in main.research_model_specs()],
@@ -227,6 +248,9 @@ if __name__ == "__main__":
         if gone:
             logger.warning(f"Models missing from OpenRouter: {gone}")
         problems = check(targets, today, remaining, gone)
+        warning = credit_warning(remaining)
+        if warning:
+            print(f"::warning::{warning}")
         for p in problems:
             print(f"::error::{p}")
         sys.exit(1 if problems else 0)

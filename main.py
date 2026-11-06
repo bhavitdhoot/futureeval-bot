@@ -113,6 +113,14 @@ DEFAULT_ECONOMY = [
     ("openrouter/openai/gpt-5.6-sol", "high"),
     ("openrouter/anthropic/claude-opus-4.8", "high"),
 ]
+# The last-resort roster: a small, cheap model for when even the previous
+# generation is unaffordable. Production (Nov 2026) measured ~$0.19 a
+# forecast for gpt-5.6-sol even at low effort, against ~$0.05 a question that
+# the credits could sustain, so capping effort alone could not stop the
+# overspend. A small model's forecast still beats no forecast.
+DEFAULT_LITE = [
+    ("openrouter/anthropic/claude-haiku-5.5|openrouter/openai/gpt-5.6-luna", "high"),
+]
 DEFAULT_BACKUPS = [
     ("openrouter/openai/gpt-5.6-sol", "high"),
     ("openrouter/anthropic/claude-opus-4.8", "high"),
@@ -332,8 +340,11 @@ def build_roster(
     effort_cap: str | None = None,
     economy: bool = False,
     max_tokens: int = MAX_TOKENS,
+    lite: bool = False,
 ) -> RosterLlm:
-    if economy:
+    if lite:
+        primary_specs = _parse_model_list("LITE_MODELS", DEFAULT_LITE)
+    elif economy:
         primary_specs = _parse_model_list("ECONOMY_MODELS", DEFAULT_ECONOMY)
     else:
         primary_specs = _parse_model_list("FORECAST_MODELS", DEFAULT_PRIMARY)
@@ -757,6 +768,7 @@ def make_bot(
     effort_cap: str | None = None,
     web_research: bool = True,
     economy: bool = False,
+    lite: bool = False,
 ) -> FutureEvalBot:
     use_asknews = asknews_configured()
     # Recorded in each forecast's metadata; run_research picks the sources itself.
@@ -776,7 +788,11 @@ def make_bot(
         required_successful_predictions=0.01,  # one surviving model is enough to publish
         llms={
             "default": build_roster(
-                n_predictions, effort_cap, economy, ECONOMY_MAX_TOKENS if economy else MAX_TOKENS
+                n_predictions,
+                effort_cap,
+                economy,
+                ECONOMY_MAX_TOKENS if economy or lite else MAX_TOKENS,
+                lite,
             ),
             "summarizer": parser,  # unused (summaries disabled) but must be set
             "researcher": researcher,
@@ -857,26 +873,29 @@ class Plan:
     web_research: bool  # run web search alongside AskNews
     why: str
     economy: bool = False  # previous-generation roster (DEFAULT_ECONOMY)
+    lite: bool = False  # small-model roster (DEFAULT_LITE), the last resort
 
     @property
     def effort_label(self) -> str:
         """The ledger bucket this plan's spend is filed under."""
-        return ledger.bucket(self.economy, self.effort_cap)
+        return ledger.bucket(self.economy, self.effort_cap, self.lite)
 
 
 # Richest first. The planner takes the first one the credits can sustain until
 # the season ends. MiniBench keeps two forecasts longest: it is the tournament
 # Metaculus watches when deciding whether to release more credits.
 PLANS = [
-    # (main, mini, economy roster, effort cap, web research beside AskNews, label)
-    (3, 2, False, None, True, "full strength"),
-    (2, 2, False, None, True, "two flagship models everywhere"),
-    (1, 2, False, None, False, "flagship, MiniBench keeps the ensemble"),
-    (1, 1, False, None, False, "one flagship forecast"),
-    (1, 2, True, None, False, "previous generation, MiniBench keeps the ensemble"),
-    (1, 1, True, None, False, "one previous-generation forecast"),
-    (1, 1, True, "medium", False, "one medium-effort previous-generation forecast"),
-    (1, 1, True, "low", False, "minimum viable coverage"),
+    # (main, mini, roster, effort cap, web research beside AskNews, label)
+    (3, 2, "flagship", None, True, "full strength"),
+    (2, 2, "flagship", None, True, "two flagship models everywhere"),
+    (1, 2, "flagship", None, False, "flagship, MiniBench keeps the ensemble"),
+    (1, 1, "flagship", None, False, "one flagship forecast"),
+    (1, 2, "economy", None, False, "previous generation, MiniBench keeps the ensemble"),
+    (1, 1, "economy", None, False, "one previous-generation forecast"),
+    (1, 1, "economy", "medium", False, "one medium-effort previous-generation forecast"),
+    (1, 1, "economy", "low", False, "one low-effort previous-generation forecast"),
+    (1, 2, "lite", None, False, "small model, MiniBench keeps the ensemble"),
+    (1, 1, "lite", None, False, "minimum viable coverage"),
 ]
 # The plan is re-chosen every five minutes from the live balance, so running
 # slightly hot corrects itself; this stops it flapping between two plans.
@@ -909,15 +928,16 @@ def plan_for_budget(
     # coverage while questions are still resolving, which costs far more than a
     # smaller ensemble does. A question forecast with one model still scores;
     # a question never forecast scores nothing.
-    if remaining < 6:
+    if remaining < maintenance.PAUSE_BELOW_USD:
         return Plan(0, 0, None, False, f"${remaining:.2f} left, paused to avoid half-finished runs")
     stats = stats or ledger.Ledger().stats()
     rate = float(_env("EXPECTED_QUESTIONS_PER_DAY") or 0) or stats.questions_per_day
     budget = affordable_per_question(remaining, today or dt.date.today(), rate)
     share = stats.minibench_share
-    for main_n, mini_n, economy, cap, web, label in PLANS:
+    for main_n, mini_n, roster, cap, web, label in PLANS:
+        economy, lite = roster == "economy", roster == "lite"
         slots = main_n * (1 - share) + mini_n * share
-        key = ledger.bucket(economy, cap)
+        key = ledger.bucket(economy, cap, lite)
         # A bucket with no measurement and no prior is treated as unaffordable.
         cost = stats.plan_cost(key, slots)
         if cost <= budget * SPEND_SLACK or label == PLANS[-1][-1]:
@@ -925,7 +945,7 @@ def plan_for_budget(
                 f"${remaining:.0f} left, ${budget:.3f} affordable per question at {rate:.1f}/day, "
                 f"this plan ~${cost:.3f} ({stats.why}), {label}"
             )
-            return Plan(main_n, mini_n, cap, web, note, economy)
+            return Plan(main_n, mini_n, cap, web, note, economy, lite)
     raise AssertionError("unreachable: the last plan is always accepted")
 
 
@@ -993,7 +1013,7 @@ async def run(mode: str, publish: bool) -> int:
     plan = plan_for_budget(remaining, dt.date.today(), book.stats())
     logger.info(
         f"Budget plan: {plan.main} forecast(s) per tournament question, {plan.mini} per MiniBench "
-        f"question, {'previous-generation' if plan.economy else 'flagship'} models, "
+        f"question, {'small' if plan.lite else 'previous-generation' if plan.economy else 'flagship'} models, "
         f"effort cap {plan.effort_cap or 'none'}, web research "
         f"{'on' if plan.web_research else 'fallback only'} ({plan.why})"
     )
@@ -1001,8 +1021,8 @@ async def run(mode: str, publish: bool) -> int:
         logger.error("Out of credits: skipping this run. Request more through the Metaculus form.")
         return 0
 
-    main_bot = make_bot(plan.main, publish, plan.effort_cap, plan.web_research, plan.economy)
-    mini_bot = make_bot(plan.mini, publish, plan.effort_cap, plan.web_research, plan.economy)
+    main_bot = make_bot(plan.main, publish, plan.effort_cap, plan.web_research, plan.economy, plan.lite)
+    mini_bot = make_bot(plan.mini, publish, plan.effort_cap, plan.web_research, plan.economy, plan.lite)
 
     if mode == "test_questions":
         main_bot.skip_previously_forecasted_questions = False
